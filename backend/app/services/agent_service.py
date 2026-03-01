@@ -267,52 +267,54 @@ def _fallback_questions(domain: str, task: str, task_ctx: Optional[dict] = None)
 # ── Personalized Recommendation Generation ─────────────────────
 
 
-RECOMMENDATION_SYSTEM_PROMPT = """You are an expert AI tools consultant. Based on the user's complete profile (their goals, domain, task, and answers to follow-up questions), recommend the BEST AI tools for their specific situation.
+RECOMMENDATION_SYSTEM_PROMPT = """You are an expert AI tools consultant. You have been given the user's profile AND a curated list of REAL tools retrieved from our verified tool database (RAG RESULTS).
 
-You have domain expertise context (PERSONA CONTEXT) to inform your recommendations.
+Your job: Select the best tools FROM THE RAG RESULTS that match this user's specific situation, and explain why each is relevant.
 
-For each recommendation, explain WHY it's specifically good for this user's situation based on their answers.
+CRITICAL RULES:
+- You MUST ONLY recommend tools that appear in the RAG RESULTS section below
+- Do NOT invent or hallucinate tool names — only use what's provided
+- If a RAG tool doesn't fit the user's situation, skip it
+- You may reword descriptions to be more user-friendly, but keep the tool name and URL exact
+- Every recommendation must have a specific 'why_recommended' tied to the user's answers
+- Prioritize tools with higher relevance scores
+- Prioritize free/freemium tools when the user seems budget-conscious
+- Recommend 2-6 items per category (only include categories that have results)
 
 OUTPUT FORMAT (strict JSON):
 {{
   "extensions": [
     {{
-      "name": "Tool Name",
-      "description": "What it does",
-      "url": "https://...",
+      "name": "Exact tool name from RAG results",
+      "description": "What it does (can reword)",
+      "url": "exact URL from RAG results",
       "free": true,
-      "why_recommended": "Specific reason based on user's answers"
+      "rating": "from RAG results if available",
+      "installs": "from RAG results if available",
+      "why_recommended": "Specific reason based on user's answers, domain, and task"
     }}
   ],
   "gpts": [
     {{
-      "name": "GPT Name",
+      "name": "Exact GPT name from RAG results",
       "description": "What it does",
-      "url": "https://chat.openai.com/g/...",
-      "rating": "4.8",
+      "url": "exact URL from RAG results",
+      "rating": "from RAG results if available",
       "why_recommended": "Specific reason based on user's answers"
     }}
   ],
   "companies": [
     {{
-      "name": "Company Name",
+      "name": "Exact company/tool name from RAG results",
       "description": "What they do",
-      "url": "https://...",
+      "url": "exact URL from RAG results",
       "why_recommended": "Specific reason based on user's answers"
     }}
   ],
-  "summary": "A 2-3 sentence personalized summary of why these tools were recommended"
+  "summary": "A 2-3 sentence personalized summary of why these tools were selected for this user's specific situation"
 }}
 
-RULES:
-- Recommend 2-4 items per category
-- Every recommendation must have a specific 'why_recommended' tied to the user's answers
-- Prioritize free/freemium tools when the user seems budget-conscious
-- Prioritize ease of use for solopreneurs or small teams
-- Prioritize scalability for larger teams
-- Be specific and actionable
-- Only recommend REAL tools that actually exist
-
+If a category has no matching RAG results, return an empty array for it.
 Return ONLY valid JSON."""
 
 
@@ -324,7 +326,13 @@ async def generate_personalized_recommendations(
     questions_answers: list[dict],
 ) -> dict:
     """
-    Generate personalized tool recommendations based on all Q&A.
+    Generate personalized tool recommendations using RAG + GPT.
+
+    Pipeline:
+        1. Query the RAG vector store with full session context
+           → gets top-20 real tools ranked by semantic similarity
+        2. Send those real tools + user profile to GPT
+           → GPT selects the best ones and writes 'why_recommended'
 
     Args:
         outcome: The outcome ID
@@ -336,13 +344,52 @@ async def generate_personalized_recommendations(
     Returns:
         Dict with 'extensions', 'gpts', 'companies', 'summary'
     """
+    from app.rag.retrieval import search_by_session
+
     settings = get_settings()
     client = _get_client()
 
-    # Load structured task context from persona doc
+    # ── Step 1: Query RAG for real tools ────────────────────────
+    rag_results = await search_by_session(
+        outcome_label=outcome_label,
+        domain=domain,
+        task=task,
+        answers=questions_answers,
+        top_k=20,
+    )
+
+    # Format RAG results for the GPT prompt
+    rag_tools_text = ""
+    if rag_results.results:
+        for i, tool in enumerate(rag_results.results, 1):
+            rag_tools_text += f"\n--- Tool #{i} (relevance: {tool.relevance_score:.3f}) ---\n"
+            rag_tools_text += f"Name: {tool.name}\n"
+            rag_tools_text += f"Description: {tool.description}\n"
+            rag_tools_text += f"Source: {tool.source}\n"
+            if tool.category:
+                rag_tools_text += f"Category: {tool.category}\n"
+            if tool.url:
+                rag_tools_text += f"URL: {tool.url}\n"
+            if tool.rating:
+                rag_tools_text += f"Rating: {tool.rating}\n"
+            if tool.installs:
+                rag_tools_text += f"Installs: {tool.installs}\n"
+            rag_tools_text += f"Persona/Domain: {tool.persona}\n"
+
+        logger.info(
+            "RAG tools retrieved for recommendations",
+            domain=domain,
+            task=task,
+            tools_found=len(rag_results.results),
+            top_score=rag_results.results[0].relevance_score if rag_results.results else 0,
+        )
+    else:
+        rag_tools_text = "(No tools found in database for this query)"
+        logger.warning("No RAG results for recommendation query", domain=domain, task=task)
+
+    # ── Step 2: Load persona context ────────────────────────────
     task_ctx = load_task_context(domain, task)
     if task_ctx and task_ctx.get("problems"):
-        # Build focused context from the matching task block
         context_parts = [f"MATCHED TASK: {task_ctx['task']}"]
         if task_ctx.get("problems"):
             context_parts.append(f"\nDOCUMENTED PROBLEMS:\n{task_ctx['problems']}")
@@ -361,6 +408,7 @@ async def generate_personalized_recommendations(
         qa_text += f"Q{i} ({qa.get('type', 'static')}): {qa.get('q', qa.get('question', ''))}\n"
         qa_text += f"A{i}: {qa.get('a', qa.get('answer', ''))}\n\n"
 
+    # ── Step 3: GPT selects + ranks from RAG results ───────────
     user_message = f"""USER PROFILE:
 - Growth Goal: {outcome_label}
 - Domain: {domain}
@@ -372,7 +420,13 @@ ALL QUESTIONS & ANSWERS:
 PERSONA CONTEXT (domain expertise):
 {persona_context}
 
-Based on everything above, recommend the most relevant AI tools, Chrome extensions, Custom GPTs, and AI companies for this user's specific situation."""
+═══════════════════════════════════════════════════════════
+RAG RESULTS — Real tools from our verified database
+(Select the best ones for this user from these results ONLY)
+═══════════════════════════════════════════════════════════
+{rag_tools_text}
+
+Based on the user's profile and answers, select the most relevant tools from the RAG RESULTS above. Group them into extensions, gpts, and companies. Write a personalized 'why_recommended' for each."""
 
     try:
         response = await client.chat.completions.create(
@@ -381,8 +435,8 @@ Based on everything above, recommend the most relevant AI tools, Chrome extensio
                 {"role": "system", "content": RECOMMENDATION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.5,
-            max_tokens=2000,
+            temperature=0.4,
+            max_tokens=2500,
             response_format={"type": "json_object"},
         )
 
@@ -390,12 +444,13 @@ Based on everything above, recommend the most relevant AI tools, Chrome extensio
         parsed = json.loads(raw)
 
         logger.info(
-            "Personalized recommendations generated",
+            "Personalized recommendations generated (RAG-powered)",
             domain=domain,
             task=task,
-            extensions=len(parsed.get("extensions", [])),
-            gpts=len(parsed.get("gpts", [])),
-            companies=len(parsed.get("companies", [])),
+            rag_tools_input=len(rag_results.results),
+            extensions_out=len(parsed.get("extensions", [])),
+            gpts_out=len(parsed.get("gpts", [])),
+            companies_out=len(parsed.get("companies", [])),
         )
 
         return {

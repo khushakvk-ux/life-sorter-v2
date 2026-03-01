@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Bot, User, Mic, MicOff, Package, Box, Gift, ArrowLeft, Plus, MessageSquare, ShoppingCart, Scale, Users, Sparkles, Youtube, History, X, Menu, Edit3, Chrome, Zap, Brain, Copy, PanelLeftClose, PanelLeftOpen, ExternalLink, Star, Settings, FileText, BarChart3, ScanLine, Video, Calendar, Sun, Moon, Type, Globe, TrendingUp, Lock, Shield, CreditCard } from 'lucide-react';
+import { Send, Bot, User, Mic, MicOff, Package, Box, Gift, ArrowLeft, Plus, MessageSquare, ShoppingCart, Scale, Users, Sparkles, Youtube, History, X, Menu, Edit3, Chrome, Zap, Brain, Copy, PanelLeftClose, PanelLeftOpen, ExternalLink, Star, Settings, FileText, BarChart3, ScanLine, Video, Calendar, Sun, Moon, Type, Globe, TrendingUp, Lock, Shield, CreditCard, Code } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import './ChatBotNew.css';
 import { formatCompaniesForDisplay, analyzeMarketGaps } from '../utils/csvParser';
@@ -1107,6 +1107,7 @@ const ChatBotNew = ({ onNavigate }) => {
   const [dynamicAnswers, setDynamicAnswers] = useState({});
   const [personaLoaded, setPersonaLoaded] = useState(null);
   const [dynamicFreeText, setDynamicFreeText] = useState('');
+  const [rcaMode, setRcaMode] = useState(false); // Claude adaptive RCA mode
 
   const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -1596,6 +1597,9 @@ const ChatBotNew = ({ onNavigate }) => {
     setPersonaLoaded(null);
     setDynamicFreeText('');
 
+    // Reset Claude RCA mode
+    setRcaMode(false);
+
     // Reset RCA state
     setRcaActive(false);
     setRcaStage('problem-definition');
@@ -1698,7 +1702,7 @@ const ChatBotNew = ({ onNavigate }) => {
     saveToSheet(`Selected Domain: ${domain}`, '', '', '');
   };
 
-  // Handle task selection (Question 3) - Loads diagnostic sections from persona docs
+  // Handle task selection (Question 3) - Loads diagnostic via Claude RCA or fallback
   const handleTaskClick = async (task) => {
     setSelectedCategory(task);
 
@@ -1711,7 +1715,7 @@ const ChatBotNew = ({ onNavigate }) => {
     setMessages(prev => [...prev, userMessage]);
     saveToSheet(`Selected Task: ${task}`, '', '', '');
 
-    // Load sections from pre-parsed persona docs (instant, no GPT)
+    // Load diagnostic questions (Claude RCA or fallback)
     setIsTyping(true);
     try {
       const sid = await ensureSession();
@@ -1724,24 +1728,35 @@ const ChatBotNew = ({ onNavigate }) => {
         const data = await res.json();
 
         if (data.questions && data.questions.length > 0) {
+          const isRca = data.rca_mode === true;
+          setRcaMode(isRca);
           setDynamicQuestions(data.questions);
           setCurrentDynamicQIndex(0);
           setDynamicAnswers({});
           setPersonaLoaded(data.persona_loaded);
 
-          // Add first section as a bot message in chat view
           const firstQ = data.questions[0];
           const sectionLabel = firstQ.section_label || 'Diagnostic';
           const taskMatched = data.task_matched || task;
+
+          // Build first bot message — include Claude's acknowledgment if present
+          let botText = '';
+          if (isRca && data.acknowledgment) {
+            botText = `${data.acknowledgment}\n\n${firstQ.question}`;
+          } else {
+            botText = `**${sectionLabel}** for *${taskMatched}*\n\n${firstQ.question}`;
+          }
+
           const botMsg = {
             id: getNextMessageId(),
-            text: `**${sectionLabel}** for *${taskMatched}*\n\n${firstQ.question}`,
+            text: botText,
             sender: 'bot',
             timestamp: new Date(),
             diagnosticOptions: firstQ.options,
             sectionIndex: 0,
             sectionKey: firstQ.section,
             allowsFreeText: firstQ.allows_free_text !== false,
+            isRcaQuestion: isRca,
           };
           setMessages(prev => [...prev, botMsg]);
           setFlowStage('diagnostic');
@@ -1758,7 +1773,7 @@ const ChatBotNew = ({ onNavigate }) => {
     showSolutionStack(task);
   };
 
-  // Handle diagnostic option click — in-chat flow
+  // Handle diagnostic option click — in-chat flow (supports both RCA & fallback)
   const handleDynamicAnswer = async (answer) => {
     const currentQ = dynamicQuestions[currentDynamicQIndex];
     const newAnswers = { ...dynamicAnswers, [currentDynamicQIndex]: answer };
@@ -1772,6 +1787,115 @@ const ChatBotNew = ({ onNavigate }) => {
       sender: 'user',
       timestamp: new Date()
     };
+
+    saveToSheet(`Diagnostic (${currentQ?.section || 'q' + currentDynamicQIndex}): ${answer}`, '', '', '');
+
+    // ── RCA Mode: call backend → Claude generates next question ──
+    if (rcaMode) {
+      setMessages(prev => [...prev, userMsg]);
+      setCurrentDynamicQIndex(prev => prev + 1);
+      setIsTyping(true);
+
+      try {
+        const sid = getSessionId();
+        if (sid) {
+          const res = await fetch(`${API_BASE}/api/v1/agent/session/answer`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: sid,
+              question_index: currentDynamicQIndex,
+              answer: answer
+            })
+          });
+          const data = await res.json();
+
+          if (data.all_answered) {
+            // Claude says we have enough — show summary & go to auth/recommendations
+            setIsTyping(false);
+
+            if (data.rca_summary || data.acknowledgment) {
+              const summaryMsg = {
+                id: getNextMessageId(),
+                text: data.acknowledgment
+                  ? `${data.acknowledgment}${data.rca_summary ? '\n\n' + data.rca_summary : ''}`
+                  : data.rca_summary || '',
+                sender: 'bot',
+                timestamp: new Date(),
+              };
+              setMessages(prev => [...prev, summaryMsg]);
+            }
+
+            if (userEmail) {
+              await showPersonalizedRecommendations();
+            } else {
+              pendingAuthActionRef.current = 'recommendations';
+              const authMsg = {
+                id: getNextMessageId(),
+                text: `Great — your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+                sender: 'bot',
+                timestamp: new Date(),
+                showAuthGate: true,
+              };
+              setMessages(prev => [...prev, authMsg]);
+              setFlowStage('auth-gate');
+            }
+            return;
+          }
+
+          // Claude gave us the next question
+          if (data.next_question) {
+            const nextQ = data.next_question;
+            setDynamicQuestions(prev => [...prev, nextQ]);
+
+            let botText = '';
+            if (data.acknowledgment) {
+              botText = `${data.acknowledgment}\n\n${nextQ.question}`;
+            } else {
+              const sectionLabel = nextQ.section_label || 'Diagnostic';
+              botText = `**${sectionLabel}**\n\n${nextQ.question}`;
+            }
+
+            const botMsg = {
+              id: getNextMessageId(),
+              text: botText,
+              sender: 'bot',
+              timestamp: new Date(),
+              diagnosticOptions: nextQ.options || [],
+              sectionIndex: currentDynamicQIndex + 1,
+              sectionKey: nextQ.section,
+              allowsFreeText: nextQ.allows_free_text !== false,
+              isRcaQuestion: true,
+            };
+            setMessages(prev => [...prev, botMsg]);
+            setIsTyping(false);
+            return;
+          }
+        }
+      } catch (e) {
+        console.log('RCA answer submission failed', e);
+      }
+
+      // If Claude fails, just end the diagnostic
+      setIsTyping(false);
+      if (userEmail) {
+        await showPersonalizedRecommendations();
+      } else {
+        pendingAuthActionRef.current = 'recommendations';
+        const authMsg = {
+          id: getNextMessageId(),
+          text: `Great — your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+          sender: 'bot',
+          timestamp: new Date(),
+          showAuthGate: true,
+        };
+        setMessages(prev => [...prev, authMsg]);
+        setFlowStage('auth-gate');
+      }
+      return;
+    }
+
+    // ── Fallback Mode: static pre-loaded questions ──────────────
 
     // Record answer in backend session
     try {
@@ -1790,8 +1914,6 @@ const ChatBotNew = ({ onNavigate }) => {
     } catch (e) {
       console.log('Session tracking: diagnostic answer', e);
     }
-
-    saveToSheet(`Diagnostic (${currentQ.section || 'q' + currentDynamicQIndex}): ${answer}`, '', '', '');
 
     const nextIndex = currentDynamicQIndex + 1;
 
@@ -3171,6 +3293,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
           <button onClick={handleStartNewIdea} title="New Chat"><Plus size={20} /></button>
           <button onClick={() => setShowChatHistory(true)} title="History"><History size={20} /></button>
           <button onClick={() => onNavigate && onNavigate('about')} title="About Us"><FileText size={20} /></button>
+          <button onClick={() => onNavigate && onNavigate('developer')} title="Developer" className="dev-header-btn"><Code size={20} /></button>
         </div>
 
         <div className="header-right">

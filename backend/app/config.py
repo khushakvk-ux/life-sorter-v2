@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     OPENAI_API_KEY_2: str = ""
     OPENAI_MODEL_NAME: str = "gpt-4o-mini"
 
+    # ── OpenRouter (Claude RCA) ────────────────────────────────
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "anthropic/claude-sonnet-4"
+
     # ── Supabase ───────────────────────────────────────────────
     SUPABASE_URL: str = "https://bbaydychuoahmdkbgghw.supabase.co"
     SUPABASE_ANON_KEY: str = ""

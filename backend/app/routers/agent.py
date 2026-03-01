@@ -23,6 +23,7 @@ from app.config import get_settings
 from app.middleware.rate_limit import limiter
 from app.services import session_store, agent_service
 from app.services.persona_doc_service import get_available_personas, get_doc_for_domain, get_diagnostic_sections
+from app.services.claude_rca_service import generate_next_rca_question
 from app.models.session import (
     SessionStage,
     GenerateDynamicQuestionsRequest,
@@ -70,6 +71,8 @@ class SetTaskResponse(BaseModel):
     persona_loaded: str
     task_matched: str = ""
     questions: list[DynamicQuestion]
+    rca_mode: bool = False          # True = Claude adaptive, False = static fallback
+    acknowledgment: str = ""        # Claude's acknowledgment text (first question only)
 
 
 class SessionContextResponse(BaseModel):
@@ -134,9 +137,9 @@ async def set_domain(request: Request, body: SetDomainRequest = Body(...)):
 async def set_task_and_generate_questions(request: Request, body: SetTaskRequest = Body(...)):
     """
     Record Q3: Task selection.
-    Loads diagnostic sections directly from the persona document.
-    No GPT call — content comes straight from the pre-parsed .docx files.
-    Returns Problems, RCA Bridge symptoms, and Opportunities as structured questions.
+    1. Loads diagnostic context from persona docs (internal only).
+    2. Calls Claude via OpenRouter for the FIRST adaptive RCA question.
+    3. Falls back to static persona-doc questions if Claude fails.
     """
     session = session_store.set_task(body.session_id, body.task)
     if not session:
@@ -147,17 +150,68 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
     session.persona_doc_name = persona_doc_name
     session.persona_context_loaded = persona_doc_name is not None
 
-    # Load diagnostic sections from pre-parsed document (instant, no GPT)
+    # Load diagnostic context from pre-parsed document (used as internal context)
     diagnostic = get_diagnostic_sections(
         domain=session.domain or "",
         task=session.task or "",
     )
 
-    dynamic_qs = []
     task_matched = ""
-
-    if diagnostic and diagnostic.get("sections"):
+    if diagnostic:
         task_matched = diagnostic.get("task_matched", "")
+        # Store the full diagnostic context for Claude to use
+        session_store.set_rca_context(session.session_id, diagnostic)
+
+    # ── Try Claude RCA for the first question ──────────────────
+    claude_result = await generate_next_rca_question(
+        outcome=session.outcome or "",
+        outcome_label=session.outcome_label or "",
+        domain=session.domain or "",
+        task=session.task or "",
+        diagnostic_context=diagnostic or {},
+        rca_history=[],
+    )
+
+    if claude_result and claude_result.get("status") == "question":
+        # Claude gave us the first adaptive question
+        first_q = DynamicQuestion(
+            question=claude_result["question"],
+            options=claude_result.get("options", []),
+            allows_free_text=True,
+            section=claude_result.get("section", "rca"),
+            section_label=claude_result.get("section_label", "Diagnostic"),
+        )
+
+        # Store question text for tracking
+        session.dynamic_questions = [claude_result["question"]]
+        session.dynamic_questions_total = -1  # Unknown — Claude decides
+        session_store.update_session(session)
+
+        logger.info(
+            "Claude RCA: first question generated",
+            session_id=session.session_id,
+            question=claude_result["question"][:80],
+        )
+
+        return SetTaskResponse(
+            session_id=session.session_id,
+            stage=session.stage.value,
+            persona_loaded=persona_doc_name or "generic",
+            task_matched=task_matched,
+            questions=[first_q],  # Single question — frontend handles adaptively
+            rca_mode=True,
+            acknowledgment=claude_result.get("acknowledgment", ""),
+        )
+
+    # ── Fallback: static persona-doc questions ─────────────────
+    logger.warning(
+        "Claude RCA unavailable, falling back to static questions",
+        session_id=session.session_id,
+    )
+    session_store.set_rca_fallback(session.session_id)
+
+    dynamic_qs = []
+    if diagnostic and diagnostic.get("sections"):
         for section in diagnostic["sections"]:
             dq = DynamicQuestion(
                 question=section["question"],
@@ -173,13 +227,9 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
     session_store.update_session(session)
 
     logger.info(
-        "Task set, diagnostic sections loaded from document",
+        "Fallback: static diagnostic sections loaded",
         session_id=session.session_id,
-        domain=session.domain,
-        task=session.task,
-        task_matched=task_matched,
         num_sections=len(dynamic_qs),
-        persona=persona_doc_name,
     )
 
     return SetTaskResponse(
@@ -188,17 +238,110 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
         persona_loaded=persona_doc_name or "generic",
         task_matched=task_matched,
         questions=dynamic_qs,
+        rca_mode=False,
     )
 
 
 @router.post("/session/answer", response_model=SubmitDynamicAnswerResponse)
 @limiter.limit(lambda: get_settings().RATE_LIMIT_CHAT)
 async def submit_dynamic_answer(request: Request, body: SubmitDynamicAnswerRequest = Body(...)):
-    """Submit an answer to a dynamic question."""
+    """
+    Submit an answer to a diagnostic question.
+    In RCA mode: sends all context + history to Claude → gets next adaptive question.
+    In fallback mode: advances through static question list.
+    """
     session = session_store.get_session(body.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # ── RCA Mode (Claude adaptive) ─────────────────────────────
+    if not session.rca_fallback_active:
+        # Record this answer
+        question_text = (
+            session.dynamic_questions[body.question_index]
+            if body.question_index < len(session.dynamic_questions)
+            else f"RCA Question {body.question_index + 1}"
+        )
+        session_store.add_rca_answer(
+            body.session_id, question_text, body.answer
+        )
+
+        # Refresh session after adding answer
+        session = session_store.get_session(body.session_id)
+
+        # Ask Claude for the next question
+        claude_result = await generate_next_rca_question(
+            outcome=session.outcome or "",
+            outcome_label=session.outcome_label or "",
+            domain=session.domain or "",
+            task=session.task or "",
+            diagnostic_context=session.rca_diagnostic_context,
+            rca_history=session.rca_history,
+        )
+
+        if claude_result and claude_result.get("status") == "question":
+            next_q = DynamicQuestion(
+                question=claude_result["question"],
+                options=claude_result.get("options", []),
+                allows_free_text=True,
+                section=claude_result.get("section", "rca"),
+                section_label=claude_result.get("section_label", "Diagnostic"),
+            )
+            # Track the question text
+            session.dynamic_questions.append(claude_result["question"])
+            session_store.update_session(session)
+
+            logger.info(
+                "Claude RCA: next question",
+                session_id=session.session_id,
+                q_index=len(session.rca_history),
+                question=claude_result["question"][:80],
+            )
+
+            return SubmitDynamicAnswerResponse(
+                session_id=session.session_id,
+                next_question=next_q,
+                all_answered=False,
+                rca_mode=True,
+                acknowledgment=claude_result.get("acknowledgment", ""),
+            )
+
+        elif claude_result and claude_result.get("status") == "complete":
+            # Claude says we have enough — move to recommendation
+            summary = claude_result.get("summary", "")
+            session_store.set_rca_complete(body.session_id, summary)
+
+            logger.info(
+                "Claude RCA: diagnostic complete",
+                session_id=session.session_id,
+                total_questions=len(session.rca_history),
+                summary=summary[:100],
+            )
+
+            return SubmitDynamicAnswerResponse(
+                session_id=session.session_id,
+                next_question=None,
+                all_answered=True,
+                rca_mode=True,
+                acknowledgment=claude_result.get("acknowledgment", ""),
+                rca_summary=summary,
+            )
+
+        else:
+            # Claude failed mid-flow — mark as complete and move on
+            logger.warning(
+                "Claude RCA failed mid-flow, completing diagnostic",
+                session_id=session.session_id,
+            )
+            session_store.set_rca_complete(body.session_id, "")
+            return SubmitDynamicAnswerResponse(
+                session_id=session.session_id,
+                next_question=None,
+                all_answered=True,
+                rca_mode=True,
+            )
+
+    # ── Fallback Mode (static questions) ───────────────────────
     if body.question_index >= len(session.dynamic_questions):
         raise HTTPException(status_code=400, detail="Invalid question index")
 
@@ -216,12 +359,9 @@ async def submit_dynamic_answer(request: Request, body: SubmitDynamicAnswerReque
 
     next_question = None
     if not all_answered and next_index < len(session.dynamic_questions):
-        # Return the next question from our stored list
-        # We need to reconstruct the DynamicQuestion — we stored the text, 
-        # but options are re-fetch from the original generation
         next_question = DynamicQuestion(
             question=session.dynamic_questions[next_index],
-            options=[],  # Options were already sent to the frontend
+            options=[],
             allows_free_text=True,
         )
 
@@ -229,6 +369,7 @@ async def submit_dynamic_answer(request: Request, body: SubmitDynamicAnswerReque
         session_id=session.session_id,
         next_question=next_question,
         all_answered=all_answered,
+        rca_mode=False,
     )
 
 

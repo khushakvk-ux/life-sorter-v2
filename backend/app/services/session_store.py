@@ -161,6 +161,55 @@ def set_recommendations(
     return update_session(session)
 
 
+# ── Claude RCA helpers ─────────────────────────────────────────
+
+def set_rca_context(
+    session_id: str, diagnostic_context: dict
+) -> Optional[SessionContext]:
+    """Store the raw dynamic-loader output as internal RCA context."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.rca_diagnostic_context = diagnostic_context
+    return update_session(session)
+
+
+def add_rca_answer(
+    session_id: str, question: str, answer: str
+) -> Optional[SessionContext]:
+    """Append a Claude RCA question-answer pair."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.rca_history.append({"question": question, "answer": answer})
+    session.questions_answers.append(
+        QuestionAnswer(question=question, answer=answer, question_type="rca")
+    )
+    return update_session(session)
+
+
+def set_rca_complete(
+    session_id: str, summary: str = ""
+) -> Optional[SessionContext]:
+    """Mark the RCA diagnostic as complete."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.rca_complete = True
+    session.rca_summary = summary
+    session.stage = SessionStage.RECOMMENDATION
+    return update_session(session)
+
+
+def set_rca_fallback(session_id: str) -> Optional[SessionContext]:
+    """Activate fallback mode (use static dynamic-loader questions)."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.rca_fallback_active = True
+    return update_session(session)
+
+
 def get_session_summary(session_id: str) -> Optional[dict]:
     """Get a summary of the full session context."""
     session = get_session(session_id)

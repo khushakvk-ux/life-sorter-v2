@@ -120,6 +120,16 @@
   margin: 0;
 }
 
+/* Developer button in header */
+.dev-header-btn {
+  color: var(--ikshan-purple) !important;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.dev-header-btn:hover {
+  opacity: 1;
+}
+
 /* Main Chat Area - Centered column */
 .chat-window {
   flex: 1;

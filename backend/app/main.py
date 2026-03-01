@@ -54,6 +54,22 @@ async def lifespan(app: FastAPI):
     from app.services.persona_doc_service import preload_all_docs
     preload_all_docs()
 
+    # Auto-ingest RAG tools if API key is available
+    if settings.openai_api_key_active:
+        try:
+            from app.rag.ingest import ingest_tools
+            result = await ingest_tools()
+            logger.info(
+                "🔍 RAG tools auto-ingested",
+                total=result.tools_ingested,
+                errors=len(result.errors),
+                status=result.status,
+            )
+        except Exception as e:
+            logger.warning("⚠️  RAG auto-ingest failed (tools won't be available)", error=str(e))
+    else:
+        logger.warning("⚠️  Skipping RAG ingest — no OpenAI API key for embeddings")
+
     yield
     logger.info("🛑 Ikshan Backend shutting down")
 
@@ -89,6 +105,8 @@ def create_app() -> FastAPI:
         ideas,
         legacy,
         agent,
+        rag,
+        sandbox,
     )
 
     # CRITICAL: Rebuild models here after routers are loaded
@@ -104,6 +122,8 @@ def create_app() -> FastAPI:
     app.include_router(recommendations.router, prefix="/api/v1", tags=["Recommendations"])
     app.include_router(ideas.router, prefix="/api/v1", tags=["Ideas"])
     app.include_router(agent.router, prefix="/api/v1", tags=["Agent"])
+    app.include_router(rag.router, prefix="/api/v1", tags=["RAG"])
+    app.include_router(sandbox.router, prefix="/api/v1", tags=["Sandbox"])
 
     # Legacy routes for frontend compatibility (/api/chat, /api/companies, etc.)
     app.include_router(legacy.router, prefix="/api", tags=["Legacy"])

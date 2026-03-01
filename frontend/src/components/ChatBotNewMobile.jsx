@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Bot, User, Mic, MicOff, Package, Box, Gift, ArrowLeft, Plus, MessageSquare, ShoppingCart, Scale, Users, Sparkles, Youtube, History, X, Menu, Edit3, Chrome, Zap, Brain, Copy, TrendingUp, FileText, Lock, Shield, CreditCard, BarChart3 } from 'lucide-react';
+import { Send, Bot, User, Mic, MicOff, Package, Box, Gift, ArrowLeft, Plus, MessageSquare, ShoppingCart, Scale, Users, Sparkles, Youtube, History, X, Menu, Edit3, Chrome, Zap, Brain, Copy, TrendingUp, FileText, Lock, Shield, CreditCard, BarChart3, Code } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import './ChatBotNewMobile.css';
 import { formatCompaniesForDisplay, analyzeMarketGaps } from '../utils/csvParser';
@@ -533,6 +533,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
   const [dynamicAnswers, setDynamicAnswers] = useState({});
   const [personaLoaded, setPersonaLoaded] = useState(null);
   const [dynamicFreeText, setDynamicFreeText] = useState('');
+  const [rcaMode, setRcaMode] = useState(false); // Claude adaptive RCA mode
   const API_BASE = import.meta.env.VITE_API_URL || '';
 
   // Helper: always get the latest session id (ref > state avoid React async gap)
@@ -1043,6 +1044,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     setDynamicAnswers({});
     setPersonaLoaded(null);
     setDynamicFreeText('');
+    setRcaMode(false);
 
     // Start fresh with welcome message
     const welcomeMessage = {
@@ -1138,7 +1140,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     saveToSheet(`Selected Domain: ${domain}`, '', '', '');
   };
 
-  // Handle task selection (Question 3) - Now triggers dynamic questions from AI agent
+  // Handle task selection (Question 3) - Claude RCA or fallback
   const handleTaskClick = async (task) => {
     setSelectedCategory(task);
 
@@ -1164,10 +1166,37 @@ const ChatBotNewMobile = ({ onNavigate }) => {
         const data = await res.json();
 
         if (data.questions && data.questions.length > 0) {
+          const isRca = data.rca_mode === true;
+          setRcaMode(isRca);
           setDynamicQuestions(data.questions);
           setCurrentDynamicQIndex(0);
           setDynamicAnswers({});
           setPersonaLoaded(data.persona_loaded);
+
+          // Add first question as a bot message
+          const firstQ = data.questions[0];
+          const sectionLabel = firstQ.section_label || 'Diagnostic';
+          const taskMatched = data.task_matched || task;
+
+          let botText = '';
+          if (isRca && data.acknowledgment) {
+            botText = `${data.acknowledgment}\n\n${firstQ.question}`;
+          } else {
+            botText = `**${sectionLabel}** for *${taskMatched}*\n\n${firstQ.question}`;
+          }
+
+          const botMsg = {
+            id: getNextMessageId(),
+            text: botText,
+            sender: 'bot',
+            timestamp: new Date(),
+            diagnosticOptions: firstQ.options,
+            sectionIndex: 0,
+            sectionKey: firstQ.section,
+            allowsFreeText: firstQ.allows_free_text !== false,
+            isRcaQuestion: isRca,
+          };
+          setMessages(prev => [...prev, botMsg]);
           setFlowStage('dynamic-questions');
           setIsTyping(false);
           return;
@@ -1182,13 +1211,124 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     showSolutionStack(task);
   };
 
-  // Handle dynamic question answer (option click)
+  // Handle dynamic question answer (option click) — supports RCA & fallback
   const handleDynamicAnswer = async (answer) => {
     const currentQ = dynamicQuestions[currentDynamicQIndex];
     const newAnswers = { ...dynamicAnswers, [currentDynamicQIndex]: answer };
     setDynamicAnswers(newAnswers);
     setDynamicFreeText('');
 
+    // Add user's selection as a chat message
+    const userMsg = {
+      id: getNextMessageId(),
+      text: answer,
+      sender: 'user',
+      timestamp: new Date()
+    };
+
+    // ── RCA Mode: call backend → Claude generates next question ──
+    if (rcaMode) {
+      setMessages(prev => [...prev, userMsg]);
+      setCurrentDynamicQIndex(prev => prev + 1);
+      setIsTyping(true);
+
+      try {
+        const sid = getSessionId();
+        if (sid) {
+          const res = await fetch(`${API_BASE}/api/v1/agent/session/answer`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: sid,
+              question_index: currentDynamicQIndex,
+              answer: answer
+            })
+          });
+          const data = await res.json();
+
+          if (data.all_answered) {
+            setIsTyping(false);
+
+            if (data.rca_summary || data.acknowledgment) {
+              const summaryMsg = {
+                id: getNextMessageId(),
+                text: data.acknowledgment
+                  ? `${data.acknowledgment}${data.rca_summary ? '\n\n' + data.rca_summary : ''}`
+                  : data.rca_summary || '',
+                sender: 'bot',
+                timestamp: new Date(),
+              };
+              setMessages(prev => [...prev, summaryMsg]);
+            }
+
+            if (userEmail) {
+              await showPersonalizedRecommendations();
+            } else {
+              pendingAuthActionRef.current = 'recommendations';
+              const authMsg = {
+                id: getNextMessageId(),
+                text: `Great — your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+                sender: 'bot',
+                timestamp: new Date(),
+                showAuthGate: true,
+              };
+              setMessages(prev => [...prev, authMsg]);
+              setFlowStage('auth-gate');
+            }
+            return;
+          }
+
+          if (data.next_question) {
+            const nextQ = data.next_question;
+            setDynamicQuestions(prev => [...prev, nextQ]);
+
+            let botText = '';
+            if (data.acknowledgment) {
+              botText = `${data.acknowledgment}\n\n${nextQ.question}`;
+            } else {
+              const sectionLabel = nextQ.section_label || 'Diagnostic';
+              botText = `**${sectionLabel}**\n\n${nextQ.question}`;
+            }
+
+            const botMsg = {
+              id: getNextMessageId(),
+              text: botText,
+              sender: 'bot',
+              timestamp: new Date(),
+              diagnosticOptions: nextQ.options || [],
+              sectionIndex: currentDynamicQIndex + 1,
+              sectionKey: nextQ.section,
+              allowsFreeText: nextQ.allows_free_text !== false,
+              isRcaQuestion: true,
+            };
+            setMessages(prev => [...prev, botMsg]);
+            setIsTyping(false);
+            return;
+          }
+        }
+      } catch (e) {
+        console.log('RCA answer submission failed', e);
+      }
+
+      setIsTyping(false);
+      if (userEmail) {
+        await showPersonalizedRecommendations();
+      } else {
+        pendingAuthActionRef.current = 'recommendations';
+        const authMsg = {
+          id: getNextMessageId(),
+          text: `Great — your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+          sender: 'bot',
+          timestamp: new Date(),
+          showAuthGate: true,
+        };
+        setMessages(prev => [...prev, authMsg]);
+        setFlowStage('auth-gate');
+      }
+      return;
+    }
+
+    // ── Fallback Mode: static pre-loaded questions ──────────────
     // Record answer in backend session
     try {
       const sid = getSessionId();
@@ -1209,9 +1349,25 @@ const ChatBotNewMobile = ({ onNavigate }) => {
 
     // Move to next question or get recommendations
     if (currentDynamicQIndex < dynamicQuestions.length - 1) {
+      const nextQ = dynamicQuestions[currentDynamicQIndex + 1];
+      const sectionLabel = nextQ.section_label || 'Diagnostic';
+      const botMsg = {
+        id: getNextMessageId(),
+        text: `**${sectionLabel}**\n\n${nextQ.question}`,
+        sender: 'bot',
+        timestamp: new Date(),
+        diagnosticOptions: nextQ.options,
+        sectionIndex: currentDynamicQIndex + 1,
+        sectionKey: nextQ.section,
+        allowsFreeText: nextQ.allows_free_text !== false,
+      };
+      setMessages(prev => [...prev, userMsg, botMsg]);
       setCurrentDynamicQIndex(currentDynamicQIndex + 1);
     } else {
       // All dynamic questions answered — gate behind auth
+      setMessages(prev => [...prev, userMsg]);
+      setCurrentDynamicQIndex(prev => prev + 1);
+
       if (userEmail) {
         await showPersonalizedRecommendations();
       } else {
@@ -2434,6 +2590,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
 
         <div className="header-actions">
           <button onClick={() => onNavigate && onNavigate('about')} title="About"><FileText size={20} /></button>
+          <button onClick={() => onNavigate && onNavigate('developer')} title="Developer" className="dev-header-btn"><Code size={20} /></button>
           <button onClick={() => setShowChatHistory(true)} title="History"><History size={20} /></button>
           <button onClick={handleStartNewIdea} title="New Chat"><Plus size={20} /></button>
         </div>

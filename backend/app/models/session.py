@@ -67,6 +67,13 @@ class SessionContext(BaseModel):
     dynamic_questions_asked: int = 0
     dynamic_questions_total: int = 0
 
+    # Claude RCA diagnostic state
+    rca_diagnostic_context: dict[str, Any] = {}   # Raw dynamic-loader output (problems, rca_bridge, etc.)
+    rca_history: list[dict[str, str]] = []         # [{"question": ..., "answer": ...}, ...]
+    rca_complete: bool = False                     # True when Claude signals "complete"
+    rca_summary: str = ""                          # Claude's summary when done
+    rca_fallback_active: bool = False              # True if Claude failed and static Qs are used
+
     # Recommended tools
     recommended_extensions: list[dict[str, Any]] = []
     recommended_gpts: list[dict[str, Any]] = []
@@ -116,6 +123,9 @@ class SubmitDynamicAnswerResponse(BaseModel):
     session_id: str
     next_question: Optional[DynamicQuestion] = None
     all_answered: bool = False
+    rca_mode: bool = False           # True = Claude adaptive mode
+    acknowledgment: str = ""         # Claude's brief acknowledgment of the answer
+    rca_summary: str = ""            # Claude's summary when diagnostic is complete
 
 
 class GetRecommendationsRequest(BaseModel):
