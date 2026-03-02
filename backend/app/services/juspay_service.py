@@ -218,30 +218,46 @@ async def verify_payment_for_stage2(order_id: str) -> dict:
     if not status.get("success"):
         return {"verified": False, "reason": "Could not fetch order status"}
 
-    order_status = status.get("status", "").upper()
+    EXPECTED_AMOUNT = 499.0  # ₹499 — must match exactly
 
-    if order_status == "CHARGED":
-        logger.info(
-            "Stage 2 payment verified",
+    order_status = status.get("status", "").upper()
+    paid_amount   = float(status.get("amount") or 0)
+
+    if order_status != "CHARGED":
+        logger.warning(
+            "Stage 2 payment not completed",
             order_id=order_id,
-            amount=status.get("amount"),
+            status=order_status,
         )
         return {
-            "verified": True,
-            "order_id": order_id,
-            "amount": status.get("amount"),
-            "txn_id": status.get("txn_id"),
+            "verified": False,
+            "reason": f"Order status is {order_status}, expected CHARGED",
+            "status": order_status,
         }
 
-    logger.warning(
-        "Stage 2 payment not completed",
+    if paid_amount < EXPECTED_AMOUNT:
+        logger.warning(
+            "Stage 2 payment amount mismatch",
+            order_id=order_id,
+            paid=paid_amount,
+            expected=EXPECTED_AMOUNT,
+        )
+        return {
+            "verified": False,
+            "reason": f"Amount paid ₹{paid_amount} is less than required ₹{EXPECTED_AMOUNT}",
+            "paid_amount": paid_amount,
+        }
+
+    logger.info(
+        "Stage 2 payment verified",
         order_id=order_id,
-        status=order_status,
+        amount=paid_amount,
     )
     return {
-        "verified": False,
-        "reason": f"Order status is {order_status}, expected CHARGED",
-        "status": order_status,
+        "verified": True,
+        "order_id": order_id,
+        "amount": paid_amount,
+        "txn_id": status.get("txn_id"),
     }
 
 
