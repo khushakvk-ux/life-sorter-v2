@@ -514,6 +514,17 @@
   40% { transform: scale(1); }
 }
 
+@keyframes progressSlide {
+  0% { width: 0%; margin-left: 0; }
+  50% { width: 70%; margin-left: 15%; }
+  100% { width: 0%; margin-left: 100%; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
 /* Identity Form Overlay */
 .identity-overlay {
   position: absolute;

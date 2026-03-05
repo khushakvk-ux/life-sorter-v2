@@ -210,6 +210,98 @@ def set_rca_fallback(session_id: str) -> Optional[SessionContext]:
     return update_session(session)
 
 
+# ── Early Recommendations helpers ──────────────────────────────
+
+def set_early_recommendations(
+    session_id: str,
+    tools: list[dict],
+    message: str = "",
+) -> Optional[SessionContext]:
+    """Store early tool recommendations generated after Q3."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.early_recommendations = tools
+    session.early_recommendations_message = message
+    return update_session(session)
+
+
+# ── Website & Audience Insights helpers ────────────────────────
+
+def set_website_url(
+    session_id: str, website_url: str, url_type: str = "website"
+) -> Optional[SessionContext]:
+    """Store the user's business website URL with metadata."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.website_url = website_url
+    session.url_type = url_type
+    session.url_submitted_at = datetime.utcnow().isoformat() + "Z"
+    return update_session(session)
+
+
+def set_audience_insights(
+    session_id: str, insights: dict
+) -> Optional[SessionContext]:
+    """Store audience analysis insights from website review."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.audience_insights = insights
+    return update_session(session)
+
+
+def set_crawl_status(
+    session_id: str, status: str
+) -> Optional[SessionContext]:
+    """Update the crawl status flag (in_progress, complete, failed)."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.crawl_status = status
+    return update_session(session)
+
+
+def set_crawl_data(
+    session_id: str,
+    crawl_raw: dict,
+    crawl_summary: dict,
+) -> Optional[SessionContext]:
+    """Store both raw crawl data and the compressed summary."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.crawl_raw = crawl_raw
+    session.crawl_summary = crawl_summary
+    session.crawl_status = crawl_summary.get("crawl_status", "complete")
+    return update_session(session)
+
+
+# ── Business Profile / Scale Questions helpers ─────────────────
+
+def set_business_profile(
+    session_id: str, profile: dict
+) -> Optional[SessionContext]:
+    """Store the business profile from scale questions."""
+    session = get_session(session_id)
+    if not session:
+        return None
+    session.business_profile = profile
+    session.scale_questions_complete = True
+    session.stage = SessionStage.DYNAMIC_QUESTIONS
+    # Also record each scale answer in the main Q&A list for traceability
+    for key, value in profile.items():
+        session.questions_answers.append(
+            QuestionAnswer(
+                question=f"Scale: {key}",
+                answer=str(value),
+                question_type="scale",
+            )
+        )
+    return update_session(session)
+
+
 def get_session_summary(session_id: str) -> Optional[dict]:
     """Get a summary of the full session context."""
     session = get_session(session_id)
@@ -234,4 +326,10 @@ def get_session_summary(session_id: str) -> Optional[dict]:
             "gpts": len(session.recommended_gpts),
             "companies": len(session.recommended_companies),
         },
+        "website_url": session.website_url,
+        "url_type": session.url_type,
+        "audience_insights": session.audience_insights if session.audience_insights else None,
+        "crawl_status": session.crawl_status or None,
+        "crawl_summary": session.crawl_summary if session.crawl_summary else None,
+        "business_profile": session.business_profile if session.business_profile else None,
     }

@@ -514,6 +514,8 @@ const ChatBotNewMobile = ({ onNavigate }) => {
   ]);
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [taskClickProcessing, setTaskClickProcessing] = useState(false);
+  const [loadingPhase, setLoadingPhase] = useState('');
   const [selectedGoal, setSelectedGoal] = useState(null);
   const [selectedDomain, setSelectedDomain] = useState(null);
   const [selectedSubDomain, setSelectedSubDomain] = useState(null);
@@ -534,6 +536,17 @@ const ChatBotNewMobile = ({ onNavigate }) => {
   const [personaLoaded, setPersonaLoaded] = useState(null);
   const [dynamicFreeText, setDynamicFreeText] = useState('');
   const [rcaMode, setRcaMode] = useState(false); // Claude adaptive RCA mode
+  const [crawlStatus, setCrawlStatus] = useState(''); // '', 'in_progress', 'complete', 'failed', 'skipped'
+  const crawlPollRef = useRef(null);
+  const crawlSummaryRef = useRef(null); // stash crawl summary to show at right time
+  const pendingDiagnosticDataRef = useRef(null);
+  const pendingReportDataRef = useRef(null); // stash {rcaSummary, crawlPoints} for post-auth
+
+  // ── Scale Questions State ──────────────────────────────────
+  const [scaleQuestions, setScaleQuestions] = useState([]);
+  const [currentScaleQIndex, setCurrentScaleQIndex] = useState(0);
+  const scaleAnswersRef = useRef({}); // ref to avoid stale closures
+
   const API_BASE = import.meta.env.VITE_API_URL || '';
 
   // Helper: always get the latest session id (ref > state avoid React async gap)
@@ -865,12 +878,18 @@ const ChatBotNewMobile = ({ onNavigate }) => {
       pendingAuthActionRef.current = null;
       const welcomeMsg = {
         id: getNextMessageId(),
-        text: `Welcome, ${payload.name}! Generating your personalized recommendations...`,
+        text: `Welcome, ${payload.name}! Generating your personalized report...`,
         sender: 'bot',
         timestamp: new Date(),
       };
       setMessages(prev => [...prev, welcomeMsg]);
-      showPersonalizedRecommendations();
+      const reportData = pendingReportDataRef.current;
+      pendingReportDataRef.current = null;
+      if (reportData) {
+        showDiagnosticReport(reportData.rcaSummary, reportData.crawlPoints);
+      } else {
+        showDiagnosticReport('', []);
+      }
       return;
     }
 
@@ -1142,6 +1161,8 @@ const ChatBotNewMobile = ({ onNavigate }) => {
 
   // Handle task selection (Question 3) - Claude RCA or fallback
   const handleTaskClick = async (task) => {
+    if (taskClickProcessing) return;
+    setTaskClickProcessing(true);
     setSelectedCategory(task);
 
     const userMessage = {
@@ -1155,9 +1176,11 @@ const ChatBotNewMobile = ({ onNavigate }) => {
 
     // Always try backend — ensure session exists first
     setIsTyping(true);
+    setLoadingPhase('tools');
     try {
       const sid = await ensureSession();
       if (sid) {
+        setLoadingPhase('diagnostic');
         const res = await fetch(`${API_BASE}/api/v1/agent/session/task`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1173,32 +1196,37 @@ const ChatBotNewMobile = ({ onNavigate }) => {
           setDynamicAnswers({});
           setPersonaLoaded(data.persona_loaded);
 
-          // Add first question as a bot message
-          const firstQ = data.questions[0];
-          const sectionLabel = firstQ.section_label || 'Diagnostic';
-          const taskMatched = data.task_matched || task;
-
-          let botText = '';
-          if (isRca && data.acknowledgment) {
-            botText = `${data.acknowledgment}\n\n${firstQ.question}`;
-          } else {
-            botText = `**${sectionLabel}** for *${taskMatched}*\n\n${firstQ.question}`;
+          // ── Show early recommendations if available ──────────
+          if (data.early_recommendations && data.early_recommendations.length > 0) {
+            const earlyRecsMsg = {
+              id: getNextMessageId(),
+              text: data.early_recommendations_message || 'Based on your goal and task, here are some tools that could help you right away.',
+              sender: 'bot',
+              timestamp: new Date(),
+              isEarlyRecommendation: true,
+              earlyTools: data.early_recommendations,
+            };
+            setMessages(prev => [...prev, earlyRecsMsg]);
           }
 
-          const botMsg = {
+          // ── Show URL input IMMEDIATELY after tool recommendations ──
+          pendingDiagnosticDataRef.current = {
+            data,
+            isRca: data.rca_mode === true,
+            task,
+          };
+
+          const urlPromptMsg = {
             id: getNextMessageId(),
-            text: botText,
+            text: `Great — here are tools that match your space.\nNow let's look at **YOUR business** specifically.`,
             sender: 'bot',
             timestamp: new Date(),
-            diagnosticOptions: firstQ.options,
-            sectionIndex: 0,
-            sectionKey: firstQ.section,
-            allowsFreeText: firstQ.allows_free_text !== false,
-            isRcaQuestion: isRca,
+            showBusinessUrlInput: true,
           };
-          setMessages(prev => [...prev, botMsg]);
-          setFlowStage('dynamic-questions');
+          setMessages(prev => [...prev, urlPromptMsg]);
+          setFlowStage('url-input');
           setIsTyping(false);
+          setLoadingPhase('');
           return;
         }
       }
@@ -1206,6 +1234,8 @@ const ChatBotNewMobile = ({ onNavigate }) => {
       console.log('Dynamic question generation failed, falling back', e);
     }
     setIsTyping(false);
+    setTaskClickProcessing(false);
+    setLoadingPhase('');
 
     // Fallback: directly show solution stack if backend call fails
     showSolutionStack(task);
@@ -1249,25 +1279,85 @@ const ChatBotNewMobile = ({ onNavigate }) => {
           if (data.all_answered) {
             setIsTyping(false);
 
-            if (data.rca_summary || data.acknowledgment) {
-              const summaryMsg = {
+            const rcaSummaryText = data.acknowledgment
+              ? `${data.acknowledgment}${data.rca_summary ? '\n\n' + data.rca_summary : ''}`
+              : data.rca_summary || '';
+
+            // Check if crawl is still running
+            if (crawlStatus === 'in_progress') {
+              const waitMsg = {
                 id: getNextMessageId(),
-                text: data.acknowledgment
-                  ? `${data.acknowledgment}${data.rca_summary ? '\n\n' + data.rca_summary : ''}`
-                  : data.rca_summary || '',
+                text: `Putting together your diagnostic report... ⏳`,
                 sender: 'bot',
                 timestamp: new Date(),
+                isCrawlWaiting: true,
               };
-              setMessages(prev => [...prev, summaryMsg]);
+              setMessages(prev => [...prev, waitMsg]);
+              setFlowStage('crawl-waiting');
+
+              const waitForCrawl = setInterval(async () => {
+                try {
+                  const sid = getSessionId();
+                  const res = await fetch(`${API_BASE}/api/v1/agent/session/${sid}/crawl-status`);
+                  const statusData = await res.json();
+                  if (statusData.crawl_status === 'complete' || statusData.crawl_status === 'failed') {
+                    setCrawlStatus(statusData.crawl_status);
+                    clearInterval(waitForCrawl);
+
+                    const crawlPoints = (statusData.crawl_status === 'complete' && statusData.crawl_summary?.points)
+                      ? statusData.crawl_summary.points : [];
+
+                    if (userEmail) {
+                      await showDiagnosticReport(rcaSummaryText, crawlPoints);
+                    } else {
+                      pendingAuthActionRef.current = 'recommendations';
+                      pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints };
+                      const authMsg = {
+                        id: getNextMessageId(),
+                        text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
+                        sender: 'bot',
+                        timestamp: new Date(),
+                        showAuthGate: true,
+                      };
+                      setMessages(prev => [...prev, authMsg]);
+                      setFlowStage('auth-gate');
+                    }
+                  }
+                } catch (e) {
+                  console.log('Crawl wait poll failed', e);
+                  clearInterval(waitForCrawl);
+                  if (userEmail) {
+                    await showDiagnosticReport(rcaSummaryText, []);
+                  } else {
+                    pendingAuthActionRef.current = 'recommendations';
+                    pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints: [] };
+                    const authMsg = {
+                      id: getNextMessageId(),
+                      text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
+                      sender: 'bot',
+                      timestamp: new Date(),
+                      showAuthGate: true,
+                    };
+                    setMessages(prev => [...prev, authMsg]);
+                    setFlowStage('auth-gate');
+                  }
+                }
+              }, 2000);
+              return;
             }
 
+            // Crawl complete or skipped
+            const crawlPoints = crawlSummaryRef.current?.points || [];
+            crawlSummaryRef.current = null;
+
             if (userEmail) {
-              await showPersonalizedRecommendations();
+              await showDiagnosticReport(rcaSummaryText, crawlPoints);
             } else {
               pendingAuthActionRef.current = 'recommendations';
+              pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints };
               const authMsg = {
                 id: getNextMessageId(),
-                text: `Great — your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+                text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
                 sender: 'bot',
                 timestamp: new Date(),
                 showAuthGate: true,
@@ -1282,13 +1372,13 @@ const ChatBotNewMobile = ({ onNavigate }) => {
             const nextQ = data.next_question;
             setDynamicQuestions(prev => [...prev, nextQ]);
 
-            let botText = '';
-            if (data.acknowledgment) {
-              botText = `${data.acknowledgment}\n\n${nextQ.question}`;
-            } else {
-              const sectionLabel = nextQ.section_label || 'Diagnostic';
-              botText = `**${sectionLabel}**\n\n${nextQ.question}`;
-            }
+            // Build text: acknowledgment + insight + question
+            const insight = nextQ.insight || data.insight || '';
+            const parts = [];
+            if (data.acknowledgment) parts.push(data.acknowledgment);
+            if (insight) parts.push(`💡 *${insight}*`);
+            parts.push(nextQ.question);
+            const botText = parts.length > 0 ? parts.join('\n\n') : nextQ.question;
 
             const botMsg = {
               id: getNextMessageId(),
@@ -1300,6 +1390,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
               sectionKey: nextQ.section,
               allowsFreeText: nextQ.allows_free_text !== false,
               isRcaQuestion: true,
+              insightText: insight,
             };
             setMessages(prev => [...prev, botMsg]);
             setIsTyping(false);
@@ -1311,13 +1402,16 @@ const ChatBotNewMobile = ({ onNavigate }) => {
       }
 
       setIsTyping(false);
+      const fallbackCrawlPts = crawlSummaryRef.current?.points || [];
+      crawlSummaryRef.current = null;
       if (userEmail) {
-        await showPersonalizedRecommendations();
+        await showDiagnosticReport('', fallbackCrawlPts);
       } else {
         pendingAuthActionRef.current = 'recommendations';
+        pendingReportDataRef.current = { rcaSummary: '', crawlPoints: fallbackCrawlPts };
         const authMsg = {
           id: getNextMessageId(),
-          text: `Great — your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+          text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
           sender: 'bot',
           timestamp: new Date(),
           showAuthGate: true,
@@ -1367,14 +1461,17 @@ const ChatBotNewMobile = ({ onNavigate }) => {
       // All dynamic questions answered — gate behind auth
       setMessages(prev => [...prev, userMsg]);
       setCurrentDynamicQIndex(prev => prev + 1);
+      const staticCrawlPts = crawlSummaryRef.current?.points || [];
+      crawlSummaryRef.current = null;
 
       if (userEmail) {
-        await showPersonalizedRecommendations();
+        await showDiagnosticReport('', staticCrawlPts);
       } else {
         pendingAuthActionRef.current = 'recommendations';
+        pendingReportDataRef.current = { rcaSummary: '', crawlPoints: staticCrawlPts };
         const authMsg = {
           id: getNextMessageId(),
-          text: `Great \u2014 your diagnostic is complete!\n\nSign in to unlock your **personalized AI tool recommendations**.`,
+          text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
           sender: 'bot',
           timestamp: new Date(),
           showAuthGate: true,
@@ -1392,10 +1489,507 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     }
   };
 
+  // Handle website URL submission for audience analysis
+  const handleWebsiteSubmit = async (websiteUrl) => {
+    if (!websiteUrl || !websiteUrl.trim()) return;
+
+    let url = websiteUrl.trim();
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'https://' + url;
+    }
+
+    const userMsg = {
+      id: getNextMessageId(),
+      text: url,
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+    setIsTyping(true);
+
+    try {
+      const sid = getSessionId();
+      if (sid) {
+        const res = await fetch(`${API_BASE}/api/v1/agent/session/website`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid, website_url: url })
+        });
+        const data = await res.json();
+
+        if (data.audience_insights) {
+          let insightText = `## Audience Analysis for Your Business\n\n`;
+
+          if (data.business_summary) {
+            insightText += `${data.business_summary}\n\n`;
+          }
+
+          insightText += `---\n\n`;
+
+          if (data.audience_insights.intended_audience) {
+            insightText += `**🎯 Who you're targeting:**\n${data.audience_insights.intended_audience}\n\n`;
+          }
+
+          if (data.audience_insights.actual_audience) {
+            insightText += `**👥 Who your content actually reaches:**\n${data.audience_insights.actual_audience}\n\n`;
+          }
+
+          if (data.audience_insights.mismatch_analysis) {
+            insightText += `**⚡ The Gap:**\n${data.audience_insights.mismatch_analysis}\n\n`;
+          }
+
+          if (data.audience_insights.recommendations && data.audience_insights.recommendations.length > 0) {
+            insightText += `**💡 Quick Wins:**\n`;
+            data.audience_insights.recommendations.forEach((rec, i) => {
+              insightText += `${i + 1}. ${rec}\n`;
+            });
+            insightText += `\n`;
+          }
+
+          insightText += `---\n\n`;
+          insightText += `Now let me put together your **personalized tool recommendations** based on everything we've discussed.`;
+
+          const insightMsg = {
+            id: getNextMessageId(),
+            text: insightText,
+            sender: 'bot',
+            timestamp: new Date(),
+            isAudienceInsight: true,
+          };
+          setMessages(prev => [...prev, insightMsg]);
+        }
+      }
+    } catch (e) {
+      console.log('Website analysis failed, continuing to recommendations', e);
+    }
+
+    setIsTyping(false);
+
+    const urlCrawlPts = crawlSummaryRef.current?.points || [];
+    crawlSummaryRef.current = null;
+    if (userEmail) {
+      await showDiagnosticReport('', urlCrawlPts);
+    } else {
+      pendingAuthActionRef.current = 'recommendations';
+      pendingReportDataRef.current = { rcaSummary: '', crawlPoints: urlCrawlPts };
+      const authMsg = {
+        id: getNextMessageId(),
+        text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
+        sender: 'bot',
+        timestamp: new Date(),
+        showAuthGate: true,
+      };
+      setMessages(prev => [...prev, authMsg]);
+      setFlowStage('auth-gate');
+    }
+  };
+
+  // ── Resume diagnostic questions after URL input ──────────────
+  const resumeDiagnosticQuestions = () => {
+    const pending = pendingDiagnosticDataRef.current;
+    if (!pending) return;
+
+    const { data, isRca, task } = pending;
+    pendingDiagnosticDataRef.current = null;
+
+    if (data.questions && data.questions.length > 0) {
+      const firstQ = data.questions[0];
+      const sectionLabel = firstQ.section_label || 'Diagnostic';
+      const taskMatched = data.task_matched || task;
+
+      // Build text: insight (if available) + question
+      const insight = firstQ.insight || data.insight || '';
+      let botText = '';
+      if (isRca) {
+        const parts = [];
+        if (data.acknowledgment) parts.push(data.acknowledgment);
+        if (insight) parts.push(`💡 *${insight}*`);
+        parts.push(firstQ.question);
+        botText = parts.join('\n\n');
+      } else {
+        botText = `**${sectionLabel}** for *${taskMatched}*\n\n${firstQ.question}`;
+      }
+
+      const botMsg = {
+        id: getNextMessageId(),
+        text: botText,
+        sender: 'bot',
+        timestamp: new Date(),
+        diagnosticOptions: firstQ.options,
+        sectionIndex: 0,
+        sectionKey: firstQ.section,
+        allowsFreeText: firstQ.allows_free_text !== false,
+        isRcaQuestion: isRca,
+        insightText: insight,
+      };
+      setMessages(prev => [...prev, botMsg]);
+      setFlowStage('dynamic-questions');
+    }
+  };
+
+  // ── Scale Questions — between URL input and Opus deep-dive ──────
+  const startScaleQuestions = async () => {
+    const sid = getSessionId();
+    if (!sid) { resumeDiagnosticQuestions(); return; }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/agent/session/${sid}/scale-questions`);
+      const data = await res.json();
+
+      if (!data.questions || data.questions.length === 0) {
+        resumeDiagnosticQuestions();
+        return;
+      }
+
+      setScaleQuestions(data.questions);
+      setCurrentScaleQIndex(0);
+      scaleAnswersRef.current = {};
+
+      const firstQ = data.questions[0];
+      const introMsg = {
+        id: getNextMessageId(),
+        text: `Before we dive deep, a few quick questions to understand your business context better.\n\n${firstQ.icon} **${firstQ.question}**`,
+        sender: 'bot',
+        timestamp: new Date(),
+        showScaleQuestion: true,
+        scaleQuestionIndex: 0,
+      };
+      setMessages(prev => [...prev, introMsg]);
+      setFlowStage('scale-questions');
+    } catch (e) {
+      console.log('Failed to load scale questions, continuing to diagnostic', e);
+      resumeDiagnosticQuestions();
+    }
+  };
+
+  const handleScaleAnswer = async (questionId, answer) => {
+    scaleAnswersRef.current[questionId] = answer;
+
+    const userMsg = {
+      id: getNextMessageId(),
+      text: answer,
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+
+    const nextIndex = currentScaleQIndex + 1;
+
+    if (nextIndex < scaleQuestions.length) {
+      const nextQ = scaleQuestions[nextIndex];
+      setCurrentScaleQIndex(nextIndex);
+
+      const nextMsg = {
+        id: getNextMessageId(),
+        text: `${nextQ.icon} **${nextQ.question}**`,
+        sender: 'bot',
+        timestamp: new Date(),
+        showScaleQuestion: true,
+        scaleQuestionIndex: nextIndex,
+      };
+      setMessages(prev => [...prev, nextMsg]);
+    } else {
+      // All scale questions answered — submit to backend + get context-aware first question
+      setFlowStage('dynamic-questions');
+      setIsTyping(true);
+
+      // Submit scale answers while fetching diagnostic question
+      const sid = getSessionId();
+      const submitScalePromise = (async () => {
+        try {
+          if (sid) {
+            await fetch(`${API_BASE}/api/v1/agent/session/scale-answers`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                session_id: sid,
+                answers: scaleAnswersRef.current,
+              }),
+            });
+          }
+        } catch (e) {
+          console.log('Scale answers submission failed (non-blocking)', e);
+        }
+      })();
+
+      const transitionMsg = {
+        id: getNextMessageId(),
+        text: `Great — I now have a clear picture of your business context. Let me ask you some deeper diagnostic questions to pinpoint the exact bottleneck.`,
+        sender: 'bot',
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, transitionMsg]);
+
+      await submitScalePromise;
+
+      try {
+        if (sid) {
+          const diagRes = await fetch(`${API_BASE}/api/v1/agent/session/start-diagnostic`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid }),
+          });
+          const diagData = await diagRes.json();
+
+          if (diagData.question && diagData.rca_mode) {
+            const firstQ = diagData.question;
+            setRcaMode(true);
+            setDynamicQuestions([firstQ]);
+            setCurrentDynamicQIndex(0);
+            setDynamicAnswers({});
+
+            const insight = firstQ.insight || diagData.insight || '';
+            const parts = [];
+            if (diagData.acknowledgment) parts.push(diagData.acknowledgment);
+            if (insight) parts.push(`💡 *${insight}*`);
+            parts.push(firstQ.question);
+
+            const botMsg = {
+              id: getNextMessageId(),
+              text: parts.join('\n\n'),
+              sender: 'bot',
+              timestamp: new Date(),
+              diagnosticOptions: firstQ.options,
+              sectionIndex: 0,
+              sectionKey: firstQ.section,
+              allowsFreeText: firstQ.allows_free_text !== false,
+              isRcaQuestion: true,
+              insightText: insight,
+            };
+            setMessages(prev => [...prev, botMsg]);
+            setIsTyping(false);
+            pendingDiagnosticDataRef.current = null;
+            return;
+          }
+        }
+      } catch (e) {
+        console.log('Context-aware diagnostic failed, using stashed question', e);
+      }
+
+      setIsTyping(false);
+      resumeDiagnosticQuestions();
+    }
+  };
+
+  // ── Business URL submission (right after tool recommendations) ──
+  const handleBusinessUrlSubmit = async (urlInput) => {
+    if (!urlInput || !urlInput.trim()) return;
+
+    let url = urlInput.trim();
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'https://' + url;
+    }
+
+    const domainRegex = /^https?:\/\/[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+/;
+    if (!domainRegex.test(url)) {
+      const errorMsg = {
+        id: getNextMessageId(),
+        text: `That doesn't look like a valid URL. Please enter a website address like **yourcompany.com**.`,
+        sender: 'bot',
+        timestamp: new Date(),
+        isError: true,
+        showBusinessUrlInput: true,
+      };
+      setMessages(prev => [...prev, errorMsg]);
+      return;
+    }
+
+    const userMsg = {
+      id: getNextMessageId(),
+      text: url,
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+
+    try {
+      const sid = getSessionId();
+      if (sid) {
+        const res = await fetch(`${API_BASE}/api/v1/agent/session/url`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid, business_url: url })
+        });
+        const data = await res.json();
+
+        if (data.crawl_started) {
+          setCrawlStatus('in_progress');
+          startCrawlPolling();
+        }
+
+        const confirmMsg = {
+          id: getNextMessageId(),
+          text: data.message || `Got it! I'm analyzing **${new URL(url).hostname}** in the background while we continue.`,
+          sender: 'bot',
+          timestamp: new Date(),
+        };
+        setMessages(prev => [...prev, confirmMsg]);
+      }
+    } catch (e) {
+      console.log('URL submission failed', e);
+      const fallbackMsg = {
+        id: getNextMessageId(),
+        text: `I'll analyze your website shortly. Let's continue with a few more questions.`,
+        sender: 'bot',
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, fallbackMsg]);
+    }
+
+    startScaleQuestions();
+  };
+
+  const handleSkipBusinessUrl = () => {
+    const userMsg = {
+      id: getNextMessageId(),
+      text: "Skip for now",
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+
+    try {
+      const sid = getSessionId();
+      if (sid) {
+        fetch(`${API_BASE}/api/v1/agent/session/skip-url`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid })
+        });
+      }
+    } catch (e) {
+      console.log('Skip URL notification failed', e);
+    }
+
+    const skipMsg = {
+      id: getNextMessageId(),
+      text: `No problem — we'll give general recommendations. You can always add your URL later.\n\nLet's continue with a few questions to understand your needs better.`,
+      sender: 'bot',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, skipMsg]);
+    setCrawlStatus('skipped');
+    startScaleQuestions();
+  };
+
+  const showCrawlSummaryMessage = (summaryData) => {
+    if (!summaryData || !summaryData.points || summaryData.points.length === 0) return;
+    const bullets = summaryData.points.map(p => `• ${p}`).join('\n');
+    const summaryMsg = {
+      id: getNextMessageId(),
+      text: `**🔍 Website Analysis Complete**\n\n${bullets}`,
+      sender: 'bot',
+      timestamp: new Date(),
+      crawlSummaryPoints: summaryData.points,
+      showCrawlDetails: true,
+    };
+    setMessages(prev => [...prev, summaryMsg]);
+  };
+
+  const startCrawlPolling = () => {
+    if (crawlPollRef.current) clearInterval(crawlPollRef.current);
+    crawlPollRef.current = setInterval(async () => {
+      try {
+        const sid = getSessionId();
+        if (!sid) return;
+        const res = await fetch(`${API_BASE}/api/v1/agent/session/${sid}/crawl-status`);
+        const data = await res.json();
+        if (data.crawl_status === 'complete' || data.crawl_status === 'failed') {
+          setCrawlStatus(data.crawl_status);
+          clearInterval(crawlPollRef.current);
+          crawlPollRef.current = null;
+
+          // Stash crawl summary — will be shown after diagnostic completes
+          if (data.crawl_status === 'complete' && data.crawl_summary) {
+            crawlSummaryRef.current = data.crawl_summary;
+          }
+        }
+      } catch (e) {
+        console.log('Crawl status poll failed', e);
+      }
+    }, 3000);
+  };
+
+  // Skip website analysis and go directly to recommendations
+  const handleSkipWebsite = async () => {
+    const userMsg = {
+      id: getNextMessageId(),
+      text: "Skip for now",
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+
+    startScaleQuestions();
+  };
+
   // Handle "Skip" on auth gate — proceed without signing in
   const handleSkipAuth = () => {
     pendingAuthActionRef.current = null;
-    showPersonalizedRecommendations();
+    const reportData = pendingReportDataRef.current;
+    pendingReportDataRef.current = null;
+    if (reportData) {
+      showDiagnosticReport(reportData.rcaSummary, reportData.crawlPoints);
+    } else {
+      showDiagnosticReport('', []);
+    }
+  };
+
+  // Unified diagnostic report: crawl summary + problem gist + tailored tools
+  const showDiagnosticReport = async (rcaSummary = '', crawlPoints = []) => {
+    setFlowStage('complete');
+    setIsTyping(true);
+
+    try {
+      const sid = getSessionId();
+      const res = await fetch(`${API_BASE}/api/v1/agent/session/recommend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid })
+      });
+      const data = await res.json();
+
+      const domainLabel = selectedDomainName || 'General';
+
+      // Combine all tools into one flat list with category tags
+      const allTools = [
+        ...(data.extensions || []).map(t => ({ ...t, _type: 'tool' })),
+        ...(data.gpts || []).map(t => ({ ...t, _type: 'gpt' })),
+        ...(data.companies || []).map(t => ({ ...t, _type: 'provider' })),
+      ];
+
+      const immediatePrompt = generateImmediatePrompt(selectedGoal, domainLabel, selectedCategory, selectedCategory);
+
+      const reportMsg = {
+        id: getNextMessageId(),
+        text: '',
+        sender: 'bot',
+        timestamp: new Date(),
+        isDiagnosticReport: true,
+        reportData: {
+          rcaSummary,
+          crawlPoints,
+          tools: allTools,
+          summary: data.summary || '',
+          domain: domainLabel,
+          task: selectedCategory,
+        },
+        showFinalActions: true,
+        showCopyPrompt: true,
+        immediatePrompt,
+        companies: data.companies || [],
+        extensions: data.extensions || [],
+        customGPTs: data.gpts || [],
+        userRequirement: selectedCategory,
+      };
+
+      setMessages(prev => [...prev, reportMsg]);
+      setIsTyping(false);
+    } catch (error) {
+      console.error('Diagnostic report failed, falling back:', error);
+      setIsTyping(false);
+      showSolutionStack(selectedCategory);
+    }
   };
 
   // Get personalized recommendations from backend
@@ -2657,9 +3251,14 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                   {getTasksForSelection().map((task, index) => (
                     <div
                       key={index}
-                      className="suggestion-card"
-                      onClick={() => handleTaskClick(task)}
-                      style={{ animationDelay: `${index * 0.05}s`, animation: 'fadeIn 0.3s ease-out forwards' }}
+                      className={`suggestion-card ${taskClickProcessing ? 'disabled' : ''}`}
+                      onClick={() => !taskClickProcessing && handleTaskClick(task)}
+                      style={{
+                        animationDelay: `${index * 0.05}s`,
+                        animation: 'fadeIn 0.3s ease-out forwards',
+                        opacity: taskClickProcessing ? 0.5 : undefined,
+                        pointerEvents: taskClickProcessing ? 'none' : undefined,
+                      }}
                     >
                       <h3>{task}</h3>
                     </div>
@@ -2703,6 +3302,399 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                     </div>
                   )}
 
+                  {/* Early Tool Recommendations — styled cards */}
+                  {message.isEarlyRecommendation && message.earlyTools && (
+                    <div className="early-recs-container" style={{ marginTop: '1rem' }}>
+                      <div style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.6rem',
+                        marginBottom: '1rem',
+                      }}>
+                        {message.earlyTools.map((tool, i) => (
+                          <div
+                            key={i}
+                            className="early-rec-card"
+                            style={{
+                              background: 'linear-gradient(135deg, #fafaff 0%, #f5f3ff 100%)',
+                              border: '1px solid rgba(124, 58, 237, 0.15)',
+                              borderRadius: '12px',
+                              padding: '0.875rem 1rem',
+                              cursor: tool.url ? 'pointer' : 'default',
+                              transition: 'all 0.25s ease',
+                              opacity: 0,
+                              animation: `fadeIn 0.4s ease-out ${i * 0.1}s forwards`,
+                            }}
+                            onClick={() => tool.url && window.open(tool.url, '_blank')}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4rem' }}>
+                              <span style={{ fontSize: '0.9rem', fontWeight: 700, color: 'var(--ikshan-text-primary, #111827)' }}>
+                                {tool.name}
+                              </span>
+                              {tool.rating && (
+                                <span style={{
+                                  fontSize: '0.72rem',
+                                  fontWeight: 600,
+                                  color: '#f59e0b',
+                                  background: '#fef3c7',
+                                  padding: '0.12rem 0.4rem',
+                                  borderRadius: '6px',
+                                }}>
+                                  ⭐ {tool.rating}
+                                </span>
+                              )}
+                            </div>
+                            <p style={{
+                              fontSize: '0.8rem',
+                              color: 'var(--ikshan-text-secondary, #6b7280)',
+                              lineHeight: 1.4,
+                              margin: '0 0 0.4rem 0',
+                            }}>
+                              {tool.description}
+                            </p>
+                            {tool.why_relevant && (
+                              <p style={{
+                                fontSize: '0.75rem',
+                                color: 'var(--ikshan-purple, #7c3aed)',
+                                fontWeight: 500,
+                                margin: 0,
+                                lineHeight: 1.35,
+                              }}>
+                                {tool.why_relevant}
+                              </p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{
+                        padding: '0.65rem 0.875rem',
+                        background: 'linear-gradient(90deg, rgba(124, 58, 237, 0.06) 0%, rgba(99, 102, 241, 0.06) 100%)',
+                        borderRadius: '10px',
+                        borderLeft: '3px solid var(--ikshan-purple, #7c3aed)',
+                      }}>
+                        <p style={{
+                          fontSize: '0.82rem',
+                          color: 'var(--ikshan-text-primary, #374151)',
+                          margin: 0,
+                          lineHeight: 1.45,
+                        }}>
+                          💡 <strong>Let's scope your problem more narrowly</strong> — a few more questions will help me find the <em>exact</em> tools for your specific situation.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Business URL Input — shown right after tool recommendations */}
+                  {message.showBusinessUrlInput && (flowStage === 'url-input' || message.isError) && (
+                    <div className="business-url-input-card" style={{
+                      marginTop: '1rem',
+                      padding: '1rem',
+                      borderRadius: '12px',
+                      border: '1px solid rgba(124, 58, 237, 0.2)',
+                      background: 'linear-gradient(135deg, #fafaff 0%, #f0eeff 100%)',
+                    }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                        <input
+                          type="url"
+                          placeholder="Paste your website URL (e.g., yourcompany.com)"
+                          style={{
+                            width: '100%',
+                            padding: '0.65rem 0.875rem',
+                            borderRadius: '8px',
+                            border: '1.5px solid var(--ikshan-border, #d1d5db)',
+                            background: 'var(--ikshan-input-bg, #fff)',
+                            color: 'var(--ikshan-text-primary, #1a1a1a)',
+                            fontSize: '0.9rem',
+                            outline: 'none',
+                            boxSizing: 'border-box',
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && e.target.value.trim()) {
+                              handleBusinessUrlSubmit(e.target.value);
+                            }
+                          }}
+                          id="business-url-input-mobile"
+                          autoFocus
+                        />
+                        <button
+                          onClick={() => {
+                            const input = document.getElementById('business-url-input-mobile');
+                            if (input && input.value.trim()) {
+                              handleBusinessUrlSubmit(input.value);
+                            }
+                          }}
+                          style={{
+                            width: '100%',
+                            padding: '0.65rem 1rem',
+                            borderRadius: '8px',
+                            border: 'none',
+                            background: 'linear-gradient(135deg, #7c3aed 0%, #6366f1 100%)',
+                            color: '#fff',
+                            fontSize: '0.85rem',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          Analyze My Business &rarr;
+                        </button>
+                      </div>
+                      <button
+                        onClick={handleSkipBusinessUrl}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: 'var(--ikshan-text-secondary, #9ca3af)',
+                          fontSize: '0.78rem',
+                          cursor: 'pointer',
+                          padding: '0.25rem 0',
+                        }}
+                      >
+                        Skip — we'll give general recommendations
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Scale Questions — quick business context classification */}
+                  {message.showScaleQuestion && flowStage === 'scale-questions' && message.scaleQuestionIndex === currentScaleQIndex && scaleQuestions[currentScaleQIndex] && (
+                    <div className="scale-question-card" style={{
+                      marginTop: '1rem',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.5rem',
+                    }}>
+                      {scaleQuestions[currentScaleQIndex].options.map((opt, i) => (
+                        <button
+                          key={i}
+                          onClick={() => handleScaleAnswer(scaleQuestions[currentScaleQIndex].id, opt)}
+                          style={{
+                            padding: '0.65rem 0.9rem',
+                            borderRadius: '10px',
+                            border: '1.5px solid rgba(124, 58, 237, 0.2)',
+                            background: 'linear-gradient(135deg, #fafaff 0%, #f5f0ff 100%)',
+                            color: 'var(--ikshan-text-primary, #1a1a1a)',
+                            fontSize: '0.82rem',
+                            fontWeight: 500,
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                            transition: 'all 0.15s ease',
+                          }}
+                        >
+                          {opt}
+                        </button>
+                      ))}
+                      <div style={{
+                        marginTop: '0.25rem',
+                        fontSize: '0.72rem',
+                        color: 'var(--ikshan-text-secondary, #9ca3af)',
+                        textAlign: 'center',
+                      }}>
+                        {currentScaleQIndex + 1} of {scaleQuestions.length}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Unified Diagnostic Report ── */}
+                  {message.isDiagnosticReport && message.reportData && (
+                    <div className="diagnostic-report" style={{
+                      marginTop: '0.75rem',
+                      borderRadius: '14px',
+                      overflow: 'hidden',
+                      border: '1px solid rgba(124, 58, 237, 0.15)',
+                      background: 'var(--ikshan-bg-primary, #fff)',
+                      boxShadow: '0 4px 20px rgba(0,0,0,0.06)',
+                    }}>
+
+                      {/* Section 1: Business Snapshot (crawl points) */}
+                      {message.reportData.crawlPoints && message.reportData.crawlPoints.length > 0 && (
+                        <div style={{
+                          padding: '0.85rem 1rem',
+                          borderBottom: '1px solid rgba(0,0,0,0.06)',
+                          background: 'linear-gradient(135deg, #fafafa 0%, #f8f7ff 100%)',
+                        }}>
+                          <div style={{
+                            fontSize: '0.65rem',
+                            fontWeight: 700,
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.08em',
+                            color: '#7c3aed',
+                            marginBottom: '0.5rem',
+                          }}>
+                            🔍 Your Business
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                            {message.reportData.crawlPoints.map((pt, i) => (
+                              <div key={i} style={{
+                                fontSize: '0.78rem',
+                                color: 'var(--ikshan-text-primary, #374151)',
+                                lineHeight: '1.35',
+                                display: 'flex',
+                                gap: '0.35rem',
+                                alignItems: 'baseline',
+                              }}>
+                                <span style={{ color: '#10b981', fontSize: '0.6rem', flexShrink: 0 }}>●</span>
+                                <span>{pt}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Section 2: Problem Gist */}
+                      {message.reportData.rcaSummary && (
+                        <div style={{
+                          padding: '0.85rem 1rem',
+                          borderBottom: '1px solid rgba(0,0,0,0.06)',
+                        }}>
+                          <div style={{
+                            fontSize: '0.65rem',
+                            fontWeight: 700,
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.08em',
+                            color: '#dc2626',
+                            marginBottom: '0.4rem',
+                          }}>
+                            🎯 The Core Issue
+                          </div>
+                          <div style={{
+                            fontSize: '0.8rem',
+                            color: 'var(--ikshan-text-primary, #1a1a1a)',
+                            lineHeight: '1.5',
+                            fontWeight: 450,
+                          }}>
+                            {message.reportData.rcaSummary}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Section 3: Tailored Tools */}
+                      {message.reportData.tools && message.reportData.tools.length > 0 && (
+                        <div style={{ padding: '0.85rem 1rem' }}>
+                          <div style={{
+                            fontSize: '0.65rem',
+                            fontWeight: 700,
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.08em',
+                            color: '#059669',
+                            marginBottom: '0.5rem',
+                          }}>
+                            🛠 Recommended For You
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                            {message.reportData.tools.slice(0, 6).map((tool, i) => (
+                              <div key={i} style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.6rem',
+                                padding: '0.55rem 0.75rem',
+                                borderRadius: '10px',
+                                border: '1px solid rgba(0,0,0,0.06)',
+                                background: 'linear-gradient(135deg, #fafafa 0%, #f9fafb 100%)',
+                                cursor: tool.url ? 'pointer' : 'default',
+                              }}
+                              onClick={() => tool.url && window.open(tool.url, '_blank')}
+                              >
+                                <div style={{
+                                  width: '28px',
+                                  height: '28px',
+                                  borderRadius: '7px',
+                                  background: tool._type === 'gpt' ? 'linear-gradient(135deg, #10b981, #059669)'
+                                    : tool._type === 'provider' ? 'linear-gradient(135deg, #3b82f6, #2563eb)'
+                                    : 'linear-gradient(135deg, #7c3aed, #6d28d9)',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  color: '#fff',
+                                  fontSize: '0.7rem',
+                                  fontWeight: 700,
+                                  flexShrink: 0,
+                                }}>
+                                  {tool._type === 'gpt' ? 'G' : tool._type === 'provider' ? 'P' : 'T'}
+                                </div>
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                  <div style={{
+                                    fontSize: '0.78rem',
+                                    fontWeight: 600,
+                                    color: 'var(--ikshan-text-primary, #1a1a1a)',
+                                    lineHeight: '1.2',
+                                  }}>
+                                    {tool.name}
+                                    {tool.free && <span style={{ fontSize: '0.6rem', color: '#10b981', marginLeft: '0.3rem', fontWeight: 500 }}>Free</span>}
+                                  </div>
+                                  {tool.why_recommended && (
+                                    <div style={{
+                                      fontSize: '0.7rem',
+                                      color: 'var(--ikshan-text-secondary, #6b7280)',
+                                      lineHeight: '1.3',
+                                      marginTop: '0.1rem',
+                                      whiteSpace: 'nowrap',
+                                      overflow: 'hidden',
+                                      textOverflow: 'ellipsis',
+                                    }}>
+                                      {tool.why_recommended}
+                                    </div>
+                                  )}
+                                </div>
+                                {tool.url && (
+                                  <span style={{ fontSize: '0.7rem', color: '#9ca3af', flexShrink: 0 }}>→</span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Crawl Summary — compressed 5-point business snapshot */}
+                  {message.showCrawlDetails && !message.isDiagnosticReport && message.crawlSummaryPoints && message.crawlSummaryPoints.length > 0 && (
+                    <div className="crawl-summary-card" style={{
+                      marginTop: '0.75rem',
+                      padding: '0.85rem 1rem',
+                      borderRadius: '12px',
+                      border: '1px solid rgba(16, 185, 129, 0.25)',
+                      background: 'linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%)',
+                      boxShadow: '0 2px 8px rgba(16, 185, 129, 0.08)',
+                    }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                        {message.crawlSummaryPoints.map((point, i) => (
+                          <div key={i} style={{
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: '0.4rem',
+                            fontSize: '0.82rem',
+                            color: 'var(--ikshan-text-primary, #1a1a1a)',
+                            lineHeight: '1.4',
+                          }}>
+                            <span style={{ color: '#10b981', fontWeight: 700, flexShrink: 0 }}>✓</span>
+                            <span>{point}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <details style={{ marginTop: '0.65rem' }}>
+                        <summary style={{
+                          fontSize: '0.75rem',
+                          color: 'var(--ikshan-text-secondary, #6b7280)',
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                          fontWeight: 500,
+                        }}>
+                          View full analysis details
+                        </summary>
+                        <div style={{
+                          marginTop: '0.4rem',
+                          padding: '0.6rem',
+                          fontSize: '0.75rem',
+                          color: 'var(--ikshan-text-secondary, #6b7280)',
+                          background: 'rgba(255,255,255,0.6)',
+                          borderRadius: '8px',
+                          lineHeight: '1.5',
+                        }}>
+                          This analysis was generated from a live crawl of your website. It captures your business positioning, target audience signals, technology stack, content strengths, and key opportunities. These insights are factored into your personalized tool recommendations.
+                        </div>
+                      </details>
+                    </div>
+                  )}
+
                   {/* Diagnostic Section Options — in-chat */}
                   {message.diagnosticOptions && message.diagnosticOptions.length > 0 && (
                     <div className="diagnostic-options" style={{ marginTop: '1rem' }}>
@@ -2712,8 +3704,13 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                             <button
                               key={i}
                               className="diagnostic-option-btn"
-                              onClick={() => handleDynamicAnswer(opt)}
-                              style={{ animationDelay: `${i * 0.04}s` }}
+                              onClick={() => !isTyping && handleDynamicAnswer(opt)}
+                              disabled={isTyping}
+                              style={{
+                                animationDelay: `${i * 0.04}s`,
+                                opacity: isTyping ? 0.5 : undefined,
+                                pointerEvents: isTyping ? 'none' : undefined,
+                              }}
                             >
                               {opt}
                             </button>
@@ -2747,6 +3744,74 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                           &#10003; Answered
                         </p>
                       )}
+                    </div>
+                  )}
+
+                  {/* Website URL Input — in-chat */}
+                  {message.showWebsiteInput && flowStage === 'website-input' && (
+                    <div className="website-input-card" style={{
+                      marginTop: '1rem',
+                      padding: '0.875rem',
+                      borderRadius: '12px',
+                      border: '1px solid var(--ikshan-border, #e5e7eb)',
+                      background: 'var(--ikshan-card-bg, #f9fafb)',
+                    }}>
+                      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                        <input
+                          type="url"
+                          placeholder="https://yourbusiness.com"
+                          style={{
+                            flex: 1,
+                            padding: '0.5rem 0.75rem',
+                            borderRadius: '8px',
+                            border: '1px solid var(--ikshan-border, #d1d5db)',
+                            background: 'var(--ikshan-input-bg, #fff)',
+                            color: 'var(--ikshan-text-primary, #1a1a1a)',
+                            fontSize: '0.85rem',
+                            outline: 'none',
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && e.target.value.trim()) {
+                              handleWebsiteSubmit(e.target.value);
+                            }
+                          }}
+                          id="website-url-input-mobile"
+                        />
+                        <button
+                          onClick={() => {
+                            const input = document.getElementById('website-url-input-mobile');
+                            if (input && input.value.trim()) {
+                              handleWebsiteSubmit(input.value);
+                            }
+                          }}
+                          style={{
+                            padding: '0.5rem 0.875rem',
+                            borderRadius: '8px',
+                            border: 'none',
+                            background: 'var(--ikshan-accent, #6366f1)',
+                            color: '#fff',
+                            fontSize: '0.8rem',
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          Analyze
+                        </button>
+                      </div>
+                      <button
+                        onClick={handleSkipWebsite}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: 'var(--ikshan-text-secondary, #6b7280)',
+                          fontSize: '0.75rem',
+                          cursor: 'pointer',
+                          textDecoration: 'underline',
+                          padding: '0.25rem 0',
+                        }}
+                      >
+                        Skip — take me to my recommendations
+                      </button>
                     </div>
                   )}
 
@@ -2848,11 +3913,79 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
               <div className="message bot">
                 <div className="avatar"><Bot size={18} /></div>
                 <div className="message-content">
-                  <div className="typing-indicator" style={{ marginLeft: 0, padding: 0, boxShadow: 'none', background: 'transparent' }}>
-                    <div className="typing-dot"></div>
-                    <div className="typing-dot"></div>
-                    <div className="typing-dot"></div>
-                  </div>
+                  {taskClickProcessing ? (
+                    <div style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.65rem',
+                      padding: '0.75rem 0',
+                      minWidth: '220px',
+                    }}>
+                      <div style={{
+                        width: '100%',
+                        height: '4px',
+                        background: 'rgba(124, 58, 237, 0.1)',
+                        borderRadius: '4px',
+                        overflow: 'hidden',
+                      }}>
+                        <div style={{
+                          height: '100%',
+                          background: 'linear-gradient(90deg, var(--ikshan-purple, #7c3aed), #a78bfa)',
+                          borderRadius: '4px',
+                          animation: 'progressSlide 2s ease-in-out infinite',
+                        }} />
+                      </div>
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                      }}>
+                        <div style={{
+                          width: '8px',
+                          height: '8px',
+                          borderRadius: '50%',
+                          background: 'var(--ikshan-purple, #7c3aed)',
+                          animation: 'pulse 1s ease-in-out infinite',
+                        }} />
+                        <span style={{
+                          fontSize: '0.8rem',
+                          color: 'var(--ikshan-text-secondary, #6b7280)',
+                          fontWeight: 500,
+                        }}>
+                          {loadingPhase === 'tools'
+                            ? '🔍 Finding the best tools for you...'
+                            : loadingPhase === 'diagnostic'
+                            ? '🧠 Preparing your personalized diagnostic...'
+                            : '⚙️ Setting things up...'}
+                        </span>
+                      </div>
+                      <div style={{
+                        display: 'flex',
+                        gap: '0.35rem',
+                        alignItems: 'center',
+                      }}>
+                        {['Analyzing', 'Matching tools', 'Building diagnostic'].map((step, i) => (
+                          <div key={i} style={{
+                            flex: 1,
+                            height: '3px',
+                            borderRadius: '3px',
+                            background: (loadingPhase === 'tools' && i === 0) ||
+                                        (loadingPhase === 'diagnostic' && i <= 1) ||
+                                        (!loadingPhase && i === 0)
+                              ? 'var(--ikshan-purple, #7c3aed)'
+                              : 'rgba(124, 58, 237, 0.15)',
+                            transition: 'background 0.5s ease',
+                          }} />
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="typing-indicator" style={{ marginLeft: 0, padding: 0, boxShadow: 'none', background: 'transparent' }}>
+                      <div className="typing-dot"></div>
+                      <div className="typing-dot"></div>
+                      <div className="typing-dot"></div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}

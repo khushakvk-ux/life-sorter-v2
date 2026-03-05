@@ -267,6 +267,415 @@ def _fallback_questions(domain: str, task: str, task_ctx: Optional[dict] = None)
 # ── Personalized Recommendation Generation ─────────────────────
 
 
+# ── Early Recommendations (after Q3, before full RCA) ──────────
+
+EARLY_RECOMMENDATION_PROMPT = """You are an expert AI tools advisor. Based on the user's growth goal, \
+domain, and task (the first 3 questions of their diagnostic), select the most \
+relevant tools from the RAG results below.
+
+These are EARLY recommendations — the user hasn't completed a full diagnostic yet, \
+so keep recommendations broad but relevant. Focus on tools that are universally \
+useful for this task area.
+
+IMPORTANT:
+- Only recommend tools from the RAG RESULTS below — never invent tools
+- Select 3-5 tools maximum that are most broadly relevant
+- Keep 'why_relevant' brief (1 sentence) — these are preliminary picks
+- Classify each as 'extension', 'gpt', or 'company' based on its source
+
+OUTPUT FORMAT (strict JSON):
+{{
+  "tools": [
+    {{
+      "name": "Exact name from RAG results",
+      "description": "Brief description",
+      "url": "exact URL from RAG results",
+      "category": "extension|gpt|company",
+      "rating": "from RAG results if available",
+      "why_relevant": "1 sentence: why this fits their goal+domain+task"
+    }}
+  ],
+  "message": "A 2-3 sentence message: present these tools as a starting point, then \
+encourage the user to continue the diagnostic for more precise, tailored recommendations. \
+Make it feel like: 'Here's what I'd suggest at a glance — but let me dig deeper into \
+your specific situation to find the exact tools you need.'"
+}}
+
+Return ONLY valid JSON."""
+
+
+def _fallback_tools_from_json(domain: str, task: str, limit: int = 5) -> list[dict]:
+    """
+    Direct keyword-based tool lookup from matched_tools_by_persona.json.
+    Used as a reliable fallback when the RAG pipeline is unavailable.
+    """
+    from pathlib import Path
+
+    json_path = Path(__file__).resolve().parent.parent.parent.parent / "matched_tools_by_persona.json"
+    if not json_path.exists():
+        logger.warning("matched_tools_by_persona.json not found for fallback")
+        return []
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception as e:
+        logger.error("Failed to read matched_tools_by_persona.json", error=str(e))
+        return []
+
+    # Find the best matching persona key from the JSON
+    domain_lower = domain.lower()
+    task_lower = task.lower()
+    search_terms = (domain_lower + " " + task_lower).split()
+
+    best_key = None
+    best_score = 0
+    for persona_key in raw_data:
+        key_lower = persona_key.lower().replace(".docx", "")
+        score = sum(1 for term in search_terms if term in key_lower)
+        # Also check if domain words are a substring
+        if domain_lower in key_lower or key_lower in domain_lower:
+            score += 5
+        if score > best_score:
+            best_score = score
+            best_key = persona_key
+
+    if not best_key:
+        # Just pick the first persona
+        best_key = next(iter(raw_data), None)
+
+    if not best_key:
+        return []
+
+    tools_list = raw_data[best_key]
+    if not isinstance(tools_list, list):
+        return []
+
+    # Score each tool by keyword relevance to the task
+    scored: list[tuple[int, dict]] = []
+    for tool in tools_list:
+        t_name = (tool.get("name") or "").lower()
+        t_desc = (tool.get("description") or "").lower()
+        t_text = t_name + " " + t_desc
+        relevance = sum(1 for term in search_terms if len(term) > 2 and term in t_text)
+        # Also boost by rating
+        try:
+            rating_bonus = int(float(tool.get("rating", "0")) * 2)
+        except (ValueError, TypeError):
+            rating_bonus = 0
+        scored.append((relevance + rating_bonus, tool))
+
+    # Sort by relevance descending, then take top N
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+    for _, tool in scored[:limit]:
+        results.append({
+            "name": tool.get("name", ""),
+            "description": (tool.get("description") or "")[:200],
+            "url": tool.get("url", ""),
+            "category": tool.get("category", "extension"),
+            "rating": tool.get("rating", ""),
+            "why_relevant": f"Highly rated tool for {domain} — {task}.",
+        })
+
+    logger.info("Fallback early recommendations from JSON", persona=best_key, count=len(results))
+    return results
+
+
+async def generate_early_recommendations(
+    outcome: str,
+    outcome_label: str,
+    domain: str,
+    task: str,
+) -> dict:
+    """
+    Generate early/preliminary tool recommendations based only on Q1+Q2+Q3.
+
+    Strategy:
+      1. Try RAG pipeline (embeddings + Qdrant + LLM selection)
+      2. If RAG is empty or fails → use direct JSON fallback
+    Always returns at least a few tools so the user sees recommendations.
+
+    Returns:
+        Dict with 'tools' (list) and 'message' (str)
+    """
+    from app.rag.retrieval import search_by_session
+
+    default_message = (
+        "Based on your goal and domain, here are some tools I'd recommend "
+        "at first glance — but let me dig deeper into your specific situation "
+        "to find the exact tools you need."
+    )
+
+    # ── Attempt 1: Full RAG pipeline ─────────────────────────────
+    try:
+        settings = get_settings()
+        client = _get_client()
+
+        rag_results = await search_by_session(
+            outcome_label=outcome_label,
+            domain=domain,
+            task=task,
+            answers=[],
+            top_k=10,
+        )
+
+        if rag_results.results:
+            # Format RAG results
+            rag_tools_text = ""
+            for i, tool in enumerate(rag_results.results, 1):
+                rag_tools_text += f"\n--- Tool #{i} (relevance: {tool.relevance_score:.3f}) ---\n"
+                rag_tools_text += f"Name: {tool.name}\n"
+                rag_tools_text += f"Description: {tool.description}\n"
+                rag_tools_text += f"Source: {tool.source}\n"
+                if tool.category:
+                    rag_tools_text += f"Category: {tool.category}\n"
+                if tool.url:
+                    rag_tools_text += f"URL: {tool.url}\n"
+                if tool.rating:
+                    rag_tools_text += f"Rating: {tool.rating}\n"
+
+            user_message = f"""USER'S SELECTIONS (Q1-Q3 only — diagnostic hasn't started yet):
+- Growth Goal: {outcome_label}
+- Domain: {domain}
+- Task: {task}
+
+═══════════════════════════════════════════════════════════
+RAG RESULTS — Real tools from our verified database
+═══════════════════════════════════════════════════════════
+{rag_tools_text}
+
+Select the 3-5 most broadly relevant tools for this user's goal+domain+task."""
+
+            response = await client.chat.completions.create(
+                model=settings.OPENAI_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": EARLY_RECOMMENDATION_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.4,
+                max_tokens=1200,
+                response_format={"type": "json_object"},
+            )
+
+            raw = response.choices[0].message.content or "{}"
+            parsed = json.loads(raw)
+
+            if parsed.get("tools"):
+                logger.info(
+                    "Early recommendations via RAG+LLM",
+                    domain=domain,
+                    task=task,
+                    tools_count=len(parsed["tools"]),
+                )
+                return {
+                    "tools": parsed["tools"],
+                    "message": parsed.get("message", default_message),
+                }
+
+        logger.warning("RAG returned empty — falling back to JSON", domain=domain, task=task)
+
+    except Exception as e:
+        logger.warning("RAG pipeline failed — falling back to JSON", error=str(e))
+
+    # ── Attempt 2: Direct JSON fallback (always works) ───────────
+    fallback_tools = _fallback_tools_from_json(domain, task, limit=5)
+    if fallback_tools:
+        return {"tools": fallback_tools, "message": default_message}
+
+    # ── Attempt 3: custom_gpts.py as last resort ─────────────────
+    from app.data.custom_gpts import get_relevant_gpts
+    gpts = get_relevant_gpts(category=task, goal=outcome, limit=4)
+    if gpts:
+        tools = [
+            {
+                "name": g["name"],
+                "description": g.get("description", ""),
+                "url": g.get("url", ""),
+                "category": "gpt",
+                "rating": g.get("rating", ""),
+                "why_relevant": f"Popular GPT for {task}.",
+            }
+            for g in gpts
+        ]
+        logger.info("Early recommendations from custom_gpts fallback", count=len(tools))
+        return {"tools": tools, "message": default_message}
+
+    logger.error("All early recommendation sources returned empty")
+    return {"tools": [], "message": ""}
+
+
+# ── Website Audience Analysis ──────────────────────────────────
+
+WEBSITE_ANALYSIS_PROMPT = """You are an expert audience & positioning analyst. You've been given:
+1. The content/HTML from a business website
+2. The user's stated growth goal, domain, and task
+3. Their RCA diagnostic history so far
+
+Your job: Analyze the website to determine WHO the business is currently \
+targeting (through their messaging, content, offers) vs. WHO might actually \
+be consuming/resonating with that content.
+
+This is a powerful insight — many businesses have an audience mismatch where \
+their content reaches Audience B while they think they're targeting Audience A.
+
+ANALYSIS FRAMEWORK:
+- **Intended Audience**: Based on the website's messaging, offers, pricing, \
+  and positioning — who are they TRYING to reach?
+- **Actual Audience**: Based on the content style, language, topics, and \
+  distribution — who is this content most likely reaching?
+- **Mismatch Analysis**: Is there a gap? Why? What signals indicate this?
+- **Recommendations**: 2-3 actionable steps to better align content with \
+  the intended audience (or pivot to serve the actual audience better)
+
+OUTPUT FORMAT (strict JSON):
+{{
+  "intended_audience": "Description of who the business seems to be targeting (1-2 sentences)",
+  "actual_audience": "Description of who the content probably reaches (1-2 sentences)",
+  "mismatch_analysis": "Analysis of the gap, if any, with specific evidence from the site (2-3 sentences)",
+  "recommendations": [
+    "Actionable recommendation 1",
+    "Actionable recommendation 2",
+    "Actionable recommendation 3"
+  ],
+  "business_summary": "Brief 1-2 sentence summary of what the business does"
+}}
+
+Be specific and reference actual content/messaging from the website. \
+If you can't detect a mismatch, say so — don't invent one. \
+Return ONLY valid JSON."""
+
+
+async def analyze_website_audience(
+    website_url: str,
+    outcome_label: str,
+    domain: str,
+    task: str,
+    rca_history: list[dict],
+) -> dict:
+    """
+    Fetch and analyze a business website to generate audience insights.
+
+    Attempts to scrape the website content, then uses GPT to analyze
+    the target audience positioning and identify potential mismatches
+    between intended and actual audience.
+
+    Args:
+        website_url: The business website URL
+        outcome_label: User's growth goal
+        domain: User's domain
+        task: User's task
+        rca_history: Diagnostic conversation so far
+
+    Returns:
+        Dict with intended_audience, actual_audience, mismatch_analysis,
+        recommendations, business_summary
+    """
+    import httpx
+
+    settings = get_settings()
+    client = _get_client()
+
+    # ── Step 1: Fetch website content ──────────────────────────
+    website_content = ""
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; IkshanBot/1.0)"},
+        ) as http_client:
+            resp = await http_client.get(website_url)
+            resp.raise_for_status()
+            raw_html = resp.text
+
+            # Basic HTML text extraction (strip tags, keep content)
+            import re
+            # Remove script and style blocks
+            clean = re.sub(r'<script[^>]*>.*?</script>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
+            clean = re.sub(r'<style[^>]*>.*?</style>', '', clean, flags=re.DOTALL | re.IGNORECASE)
+            # Remove HTML tags
+            clean = re.sub(r'<[^>]+>', ' ', clean)
+            # Collapse whitespace
+            clean = re.sub(r'\s+', ' ', clean).strip()
+            # Limit to first ~4000 chars to stay within token limits
+            website_content = clean[:4000]
+
+            logger.info(
+                "Website content fetched",
+                url=website_url,
+                content_length=len(website_content),
+            )
+    except Exception as e:
+        logger.warning(
+            "Could not fetch website content",
+            url=website_url,
+            error=str(e),
+        )
+        website_content = f"(Could not fetch website at {website_url} — analyze based on URL and user context only)"
+
+    # ── Step 2: Build context ──────────────────────────────────
+    rca_text = ""
+    if rca_history:
+        for i, qa in enumerate(rca_history, 1):
+            rca_text += f"Q{i}: {qa.get('question', '')}\nA{i}: {qa.get('answer', '')}\n\n"
+
+    user_message = f"""WEBSITE URL: {website_url}
+
+WEBSITE CONTENT (extracted text):
+{website_content}
+
+USER CONTEXT:
+- Growth Goal: {outcome_label}
+- Domain: {domain}
+- Task: {task}
+
+DIAGNOSTIC CONVERSATION SO FAR:
+{rca_text if rca_text else "(No diagnostic answers yet)"}
+
+Analyze this website and provide audience insights."""
+
+    # ── Step 3: GPT analysis ──────────────────────────────────
+    try:
+        response = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": WEBSITE_ANALYSIS_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.5,
+            max_tokens=1000,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content or "{}"
+        parsed = json.loads(raw)
+
+        logger.info(
+            "Website audience analysis complete",
+            url=website_url,
+            has_mismatch=bool(parsed.get("mismatch_analysis")),
+        )
+
+        return {
+            "intended_audience": parsed.get("intended_audience", ""),
+            "actual_audience": parsed.get("actual_audience", ""),
+            "mismatch_analysis": parsed.get("mismatch_analysis", ""),
+            "recommendations": parsed.get("recommendations", []),
+            "business_summary": parsed.get("business_summary", ""),
+        }
+
+    except Exception as e:
+        logger.error("Website audience analysis GPT call failed", error=str(e))
+        return {
+            "intended_audience": "",
+            "actual_audience": "",
+            "mismatch_analysis": "Analysis could not be completed at this time.",
+            "recommendations": [],
+            "business_summary": "",
+        }
+
+
 RECOMMENDATION_SYSTEM_PROMPT = """You are an expert AI tools consultant. You have been given the user's profile AND a curated list of REAL tools retrieved from our verified tool database (RAG RESULTS).
 
 Your job: Select the best tools FROM THE RAG RESULTS that match this user's specific situation, and explain why each is relevant.

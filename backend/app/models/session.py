@@ -21,6 +21,8 @@ class SessionStage(str, Enum):
     OUTCOME = "outcome"           # Q1: Growth bucket selection
     DOMAIN = "domain"             # Q2: Sub-category / domain selection
     TASK = "task"                 # Q3: Task selection
+    URL_INPUT = "url_input"       # Business URL collection (after early recs)
+    SCALE_QUESTIONS = "scale_questions"      # Business scale/context classification
     DYNAMIC_QUESTIONS = "dynamic_questions"  # AI-generated follow-up questions
     RECOMMENDATION = "recommendation"       # Final tool recommendation
     COMPLETE = "complete"
@@ -74,6 +76,25 @@ class SessionContext(BaseModel):
     rca_summary: str = ""                          # Claude's summary when done
     rca_fallback_active: bool = False              # True if Claude failed and static Qs are used
 
+    # Early recommendations (after Q3, before full RCA)
+    early_recommendations: list[dict[str, Any]] = []   # Tools recommended based on Q1+Q2+Q3 only
+    early_recommendations_message: str = ""             # Encouragement message to continue RCA
+
+    # Website & audience insights
+    website_url: Optional[str] = None                   # Business website URL
+    url_submitted_at: Optional[str] = None              # ISO timestamp of URL submission
+    url_type: Optional[str] = None                      # "website" or "social_profile"
+    audience_insights: dict[str, Any] = {}              # {intended_audience, actual_audience, mismatch_analysis, recommendations}
+
+    # Crawl data (populated asynchronously after URL submission)
+    crawl_raw: dict[str, Any] = {}                      # Raw crawl output: homepage, pages_crawled, tech_signals, etc.
+    crawl_summary: dict[str, Any] = {}                  # Compressed summary: points, crawl_status, completed_at
+    crawl_status: str = ""                              # "in_progress", "complete", "failed", or empty
+
+    # Business scale / profile (populated from Scale Questions)
+    business_profile: dict[str, Any] = {}               # {team_size, revenue_range, business_stage, ...}
+    scale_questions_complete: bool = False               # True when all scale Qs answered
+
     # Recommended tools
     recommended_extensions: list[dict[str, Any]] = []
     recommended_gpts: list[dict[str, Any]] = []
@@ -102,6 +123,7 @@ class DynamicQuestion(BaseModel):
     allows_free_text: bool = True
     section: str = ""         # problems, rca_bridge, opportunities
     section_label: str = ""   # Human-readable label
+    insight: str = ""         # Knowledge-embedded teaching nugget (stat, benchmark, pattern)
 
 
 class GenerateDynamicQuestionsResponse(BaseModel):
@@ -126,6 +148,7 @@ class SubmitDynamicAnswerResponse(BaseModel):
     rca_mode: bool = False           # True = Claude adaptive mode
     acknowledgment: str = ""         # Claude's brief acknowledgment of the answer
     rca_summary: str = ""            # Claude's summary when diagnostic is complete
+    insight: str = ""                # Teaching insight for the next question
 
 
 class GetRecommendationsRequest(BaseModel):

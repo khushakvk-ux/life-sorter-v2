@@ -7,12 +7,15 @@ Endpoints for the AI agent flow:
 POST /api/v1/agent/session              — Create a new session
 POST /api/v1/agent/session/outcome      — Record Q1 (outcome)
 POST /api/v1/agent/session/domain       — Record Q2 (domain)
-POST /api/v1/agent/session/task         — Record Q3 (task) + generate dynamic Qs
+POST /api/v1/agent/session/task         — Record Q3 (task) + early recs + generate dynamic Qs
 POST /api/v1/agent/session/answer       — Submit dynamic question answer
+POST /api/v1/agent/session/website      — Submit website for audience analysis
 POST /api/v1/agent/session/recommend    — Get final personalized recommendations
 GET  /api/v1/agent/session/{id}         — Get full session context
 GET  /api/v1/agent/personas             — List available persona domains
 """
+
+import asyncio
 
 import structlog
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -22,6 +25,7 @@ from typing import Any, Optional
 from app.config import get_settings
 from app.middleware.rate_limit import limiter
 from app.services import session_store, agent_service
+from app.services.crawl_service import detect_url_type, run_background_crawl
 from app.services.persona_doc_service import get_available_personas, get_doc_for_domain, get_diagnostic_sections
 from app.services.claude_rca_service import generate_next_rca_question
 from app.models.session import (
@@ -65,6 +69,15 @@ class SetTaskRequest(BaseModel):
     task: str              # e.g., 'Generate social media posts captions & hooks'
 
 
+class EarlyToolRecommendation(BaseModel):
+    name: str
+    description: str
+    url: Optional[str] = None
+    category: str = ""       # 'extension', 'gpt', 'company'
+    rating: Optional[str] = None
+    why_relevant: str = ""   # Brief relevance note based on Q1-Q3
+
+
 class SetTaskResponse(BaseModel):
     session_id: str
     stage: str
@@ -73,6 +86,30 @@ class SetTaskResponse(BaseModel):
     questions: list[DynamicQuestion]
     rca_mode: bool = False          # True = Claude adaptive, False = static fallback
     acknowledgment: str = ""        # Claude's acknowledgment text (first question only)
+    insight: str = ""               # Teaching insight for the first question
+    # Early recommendations after Q3
+    early_recommendations: list[EarlyToolRecommendation] = []
+    early_recommendations_message: str = ""  # Message urging user to continue RCA
+
+
+class SubmitWebsiteRequest(BaseModel):
+    session_id: str
+    website_url: str          # e.g., 'https://example.com'
+
+
+class AudienceInsight(BaseModel):
+    intended_audience: str = ""     # Who they seem to be targeting
+    actual_audience: str = ""       # Who their content actually reaches
+    mismatch_analysis: str = ""     # Gap between intended and actual
+    recommendations: list[str] = [] # Actionable suggestions
+
+
+class WebsiteAnalysisResponse(BaseModel):
+    session_id: str
+    website_url: str
+    audience_insights: AudienceInsight
+    business_summary: str = ""      # Brief overview of the business
+    analysis_note: str = ""         # Message for the user
 
 
 class SessionContextResponse(BaseModel):
@@ -86,6 +123,13 @@ class SessionContextResponse(BaseModel):
     questions_answers: list[dict[str, Any]] = []
     dynamic_questions_progress: str = "0/0"
     recommendations: dict[str, Any] = {}
+    website_url: Optional[str] = None
+    url_type: Optional[str] = None
+    audience_insights: Optional[dict[str, Any]] = None
+    crawl_status: Optional[str] = None
+    crawl_summary: Optional[dict[str, Any]] = None
+    business_profile: Optional[dict[str, Any]] = None
+    scale_questions_complete: bool = False
 
 
 # ── Endpoints ──────────────────────────────────────────────────
@@ -138,8 +182,12 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
     """
     Record Q3: Task selection.
     1. Loads diagnostic context from persona docs (internal only).
-    2. Calls Claude via OpenRouter for the FIRST adaptive RCA question.
-    3. Falls back to static persona-doc questions if Claude fails.
+    2. Generates EARLY tool recommendations based on Q1+Q2+Q3 context.
+    3. Calls Claude via OpenRouter for the FIRST adaptive RCA question.
+    4. Falls back to static persona-doc questions if Claude fails.
+
+    The early recommendations give the user immediate value while
+    encouraging them to continue the RCA for more precise tools.
     """
     session = session_store.set_task(body.session_id, body.task)
     if not session:
@@ -162,15 +210,66 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
         # Store the full diagnostic context for Claude to use
         session_store.set_rca_context(session.session_id, diagnostic)
 
-    # ── Try Claude RCA for the first question ──────────────────
-    claude_result = await generate_next_rca_question(
-        outcome=session.outcome or "",
-        outcome_label=session.outcome_label or "",
-        domain=session.domain or "",
-        task=session.task or "",
-        diagnostic_context=diagnostic or {},
-        rca_history=[],
-    )
+    # ── Generate EARLY recommendations + first Claude question IN PARALLEL ─
+    early_recs = []
+    early_message = ""
+
+    async def _get_early_recs():
+        nonlocal early_recs, early_message
+        try:
+            early_result = await agent_service.generate_early_recommendations(
+                outcome=session.outcome or "",
+                outcome_label=session.outcome_label or "",
+                domain=session.domain or "",
+                task=session.task or "",
+            )
+            if early_result and early_result.get("tools"):
+                early_recs = [
+                    EarlyToolRecommendation(
+                        name=t.get("name", ""),
+                        description=t.get("description", ""),
+                        url=t.get("url"),
+                        category=t.get("category", ""),
+                        rating=t.get("rating"),
+                        why_relevant=t.get("why_relevant", ""),
+                    )
+                    for t in early_result["tools"]
+                ]
+                early_message = early_result.get("message", "")
+                session_store.set_early_recommendations(
+                    session.session_id,
+                    tools=early_result["tools"],
+                    message=early_message,
+                )
+                logger.info(
+                    "Early recommendations generated after Q3",
+                    session_id=session.session_id,
+                    tools_count=len(early_recs),
+                )
+        except Exception as e:
+            logger.warning(
+                "Early recommendations failed (non-blocking)",
+                session_id=session.session_id,
+                error=str(e),
+            )
+
+    claude_result_holder = [None]
+
+    async def _get_first_rca():
+        claude_result_holder[0] = await generate_next_rca_question(
+            outcome=session.outcome or "",
+            outcome_label=session.outcome_label or "",
+            domain=session.domain or "",
+            task=session.task or "",
+            diagnostic_context=diagnostic or {},
+            rca_history=[],
+            business_profile=session.business_profile or None,
+        )
+
+    # Run both in parallel — cuts Q3 delay by ~40-50%
+    await asyncio.gather(_get_early_recs(), _get_first_rca())
+
+    claude_result = claude_result_holder[0]
 
     if claude_result and claude_result.get("status") == "question":
         # Claude gave us the first adaptive question
@@ -180,6 +279,7 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
             allows_free_text=True,
             section=claude_result.get("section", "rca"),
             section_label=claude_result.get("section_label", "Diagnostic"),
+            insight=claude_result.get("insight", ""),
         )
 
         # Store question text for tracking
@@ -201,6 +301,9 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
             questions=[first_q],  # Single question — frontend handles adaptively
             rca_mode=True,
             acknowledgment=claude_result.get("acknowledgment", ""),
+            insight=claude_result.get("insight", ""),
+            early_recommendations=early_recs,
+            early_recommendations_message=early_message,
         )
 
     # ── Fallback: static persona-doc questions ─────────────────
@@ -238,6 +341,112 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
         persona_loaded=persona_doc_name or "generic",
         task_matched=task_matched,
         questions=dynamic_qs,
+        rca_mode=False,
+        early_recommendations=early_recs,
+        early_recommendations_message=early_message,
+    )
+
+
+# ── New: Context-aware first diagnostic question ───────────────
+
+
+class StartDiagnosticRequest(BaseModel):
+    session_id: str
+
+
+class StartDiagnosticResponse(BaseModel):
+    session_id: str
+    question: Optional[DynamicQuestion] = None
+    acknowledgment: str = ""
+    insight: str = ""
+    rca_mode: bool = True
+    context_used: list[str] = []   # What context influenced the question
+
+
+@router.post("/session/start-diagnostic", response_model=StartDiagnosticResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_CHAT)
+async def start_diagnostic(request: Request, body: StartDiagnosticRequest = Body(...)):
+    """
+    Generate the first diagnostic question with FULL context:
+    crawl summary + business profile + Q1/Q2/Q3.
+
+    Called after scale questions are done (and crawl may have completed).
+    Replaces the stashed first question with a context-aware one.
+    """
+    session = session_store.get_session(body.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Gather all available context
+    diagnostic = session.rca_diagnostic_context or {}
+    business_profile = session.business_profile or None
+    crawl_summary = session.crawl_summary or None
+
+    context_used = []
+    if business_profile:
+        context_used.append("business_profile")
+    if crawl_summary and crawl_summary.get("points"):
+        context_used.append("crawl_summary")
+
+    logger.info(
+        "start-diagnostic: generating context-aware first question",
+        session_id=session.session_id,
+        context_used=context_used,
+    )
+
+    # Reset RCA history for fresh start
+    session.rca_history = []
+    session.dynamic_questions = []
+    session_store.update_session(session)
+
+    claude_result = await generate_next_rca_question(
+        outcome=session.outcome or "",
+        outcome_label=session.outcome_label or "",
+        domain=session.domain or "",
+        task=session.task or "",
+        diagnostic_context=diagnostic,
+        rca_history=[],
+        business_profile=business_profile,
+        crawl_summary=crawl_summary,
+    )
+
+    if claude_result and claude_result.get("status") == "question":
+        first_q = DynamicQuestion(
+            question=claude_result["question"],
+            options=claude_result.get("options", []),
+            allows_free_text=True,
+            section=claude_result.get("section", "rca"),
+            section_label=claude_result.get("section_label", "Diagnostic"),
+            insight=claude_result.get("insight", ""),
+        )
+
+        session.dynamic_questions = [claude_result["question"]]
+        session.dynamic_questions_total = -1
+        session_store.update_session(session)
+
+        logger.info(
+            "start-diagnostic: context-aware question generated",
+            session_id=session.session_id,
+            context_used=context_used,
+            question=claude_result["question"][:80],
+        )
+
+        return StartDiagnosticResponse(
+            session_id=session.session_id,
+            question=first_q,
+            acknowledgment=claude_result.get("acknowledgment", ""),
+            insight=claude_result.get("insight", ""),
+            rca_mode=True,
+            context_used=context_used,
+        )
+
+    # Claude failed — return empty (frontend will fall back to stashed question)
+    logger.warning(
+        "start-diagnostic: Claude failed, frontend should use stashed question",
+        session_id=session.session_id,
+    )
+    return StartDiagnosticResponse(
+        session_id=session.session_id,
         rca_mode=False,
     )
 
@@ -277,6 +486,8 @@ async def submit_dynamic_answer(request: Request, body: SubmitDynamicAnswerReque
             task=session.task or "",
             diagnostic_context=session.rca_diagnostic_context,
             rca_history=session.rca_history,
+            business_profile=session.business_profile or None,
+            crawl_summary=session.crawl_summary or None,
         )
 
         if claude_result and claude_result.get("status") == "question":
@@ -286,6 +497,7 @@ async def submit_dynamic_answer(request: Request, body: SubmitDynamicAnswerReque
                 allows_free_text=True,
                 section=claude_result.get("section", "rca"),
                 section_label=claude_result.get("section_label", "Diagnostic"),
+                insight=claude_result.get("insight", ""),
             )
             # Track the question text
             session.dynamic_questions.append(claude_result["question"])
@@ -304,6 +516,7 @@ async def submit_dynamic_answer(request: Request, body: SubmitDynamicAnswerReque
                 all_answered=False,
                 rca_mode=True,
                 acknowledgment=claude_result.get("acknowledgment", ""),
+                insight=claude_result.get("insight", ""),
             )
 
         elif claude_result and claude_result.get("status") == "complete":
@@ -474,9 +687,368 @@ async def get_session_context(request: Request, session_id: str):
     return SessionContextResponse(**summary)
 
 
+# ── Scale Questions — Business Context Classification ──────────
+
+# Static scale questions asked between URL input and Opus deep-dive.
+# These calibrate the Opus diagnostic to the user's business maturity.
+SCALE_QUESTIONS = [
+    {
+        "id": "team_size",
+        "question": "How big is your team right now?",
+        "options": [
+            "Just me (solo founder / freelancer)",
+            "2–5 people",
+            "6–20 people",
+            "21–100 people",
+            "100+ people",
+        ],
+        "icon": "👥",
+    },
+    {
+        "id": "current_stack",
+        "question": "What tools are you currently using for this?",
+        "options": [
+            "Google Sheets / Excel — manual tracking",
+            "Basic CRM (HubSpot Free, Zoho, Freshsales)",
+            "Marketing tools (Mailchimp, Buffer, Canva)",
+            "Paid CRM + automation (Salesforce, ActiveCampaign)",
+            "Custom-built / dev tools (Notion, Airtable, scripts)",
+            "Nothing yet — doing it manually or not at all",
+        ],
+        "icon": "🛠️",
+    },
+    {
+        "id": "business_stage",
+        "question": "Which stage best describes your business?",
+        "options": [
+            "Idea / validation stage",
+            "Early traction (some customers)",
+            "Growth mode (scaling what works)",
+            "Established (optimizing & expanding)",
+            "Enterprise / multi-product",
+        ],
+        "icon": "🚀",
+    },
+    {
+        "id": "primary_channel",
+        "question": "Where do most of your customers come from today?",
+        "options": [
+            "Word of mouth / referrals",
+            "Social media (organic)",
+            "Paid ads (Google, Meta, etc.)",
+            "Content / SEO / inbound",
+            "Outbound sales / cold outreach",
+            "Marketplace / platform (Amazon, Upwork, etc.)",
+        ],
+        "icon": "📣",
+    },
+    {
+        "id": "biggest_constraint",
+        "question": "What's the single biggest constraint you face right now?",
+        "options": [
+            "Time — I'm doing everything myself",
+            "Money — limited budget for tools / hiring",
+            "Knowledge — not sure what to do next",
+            "People — can't find / manage the right team",
+            "Systems — no repeatable process in place",
+        ],
+        "icon": "🔒",
+    },
+]
+
+
+class ScaleQuestionItem(BaseModel):
+    id: str
+    question: str
+    options: list[str]
+    icon: str = ""
+
+
+class ScaleQuestionsResponse(BaseModel):
+    session_id: str
+    questions: list[ScaleQuestionItem]
+    total: int
+
+
+class SubmitScaleAnswersRequest(BaseModel):
+    session_id: str
+    answers: dict[str, str]   # {"team_size": "Just me ...", "current_stack": "...", ...}
+
+
+class SubmitScaleAnswersResponse(BaseModel):
+    session_id: str
+    business_profile: dict[str, str]
+    message: str
+
+
+@router.get("/session/{session_id}/scale-questions", response_model=ScaleQuestionsResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_DEFAULT)
+async def get_scale_questions(request: Request, session_id: str):
+    """
+    Return the business scale / context classification questions.
+
+    These are shown after URL submission and before Opus deep-dive.
+    They're quick multiple-choice questions (no AI involved) that
+    create a business_profile{} to calibrate the diagnostic.
+    """
+    session = session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    questions = [
+        ScaleQuestionItem(
+            id=q["id"],
+            question=q["question"],
+            options=q["options"],
+            icon=q.get("icon", ""),
+        )
+        for q in SCALE_QUESTIONS
+    ]
+
+    return ScaleQuestionsResponse(
+        session_id=session_id,
+        questions=questions,
+        total=len(questions),
+    )
+
+
+@router.post("/session/scale-answers", response_model=SubmitScaleAnswersResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_DEFAULT)
+async def submit_scale_answers(request: Request, body: SubmitScaleAnswersRequest = Body(...)):
+    """
+    Record all scale question answers at once.
+
+    Builds a business_profile{} and stores it in the session.
+    This profile is injected into the Opus system prompt to calibrate
+    the depth and complexity of diagnostic questions.
+    """
+    session = session_store.get_session(body.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Build business profile from answers
+    business_profile = {}
+    for q in SCALE_QUESTIONS:
+        qid = q["id"]
+        if qid in body.answers:
+            business_profile[qid] = body.answers[qid]
+
+    # Store in session
+    session_store.set_business_profile(body.session_id, business_profile)
+
+    logger.info(
+        "Scale questions answered, business profile set",
+        session_id=body.session_id,
+        profile_keys=list(business_profile.keys()),
+    )
+
+    return SubmitScaleAnswersResponse(
+        session_id=body.session_id,
+        business_profile=business_profile,
+        message="Got it — I now understand your business context. Let's dive deeper.",
+    )
+
+
 @router.get("/personas")
 @limiter.limit(lambda: get_settings().RATE_LIMIT_DEFAULT)
 async def list_personas(request: Request):
     """List all available persona domains with document mappings."""
     personas = get_available_personas()
     return {"personas": personas, "count": len(personas)}
+
+
+# ── Business URL & Crawl Endpoints ─────────────────────────────
+
+
+class SubmitUrlRequest(BaseModel):
+    session_id: str
+    business_url: str          # e.g., 'https://example.com' or 'instagram.com/brand'
+
+
+class SubmitUrlResponse(BaseModel):
+    session_id: str
+    business_url: str
+    url_type: str              # "website" or "social_profile"
+    crawl_started: bool
+    message: str
+
+
+class CrawlStatusResponse(BaseModel):
+    session_id: str
+    crawl_status: str          # "in_progress", "complete", "failed", ""
+    crawl_summary: Optional[dict] = None
+
+
+@router.post("/session/url", response_model=SubmitUrlResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_CHAT)
+async def submit_business_url(request: Request, body: SubmitUrlRequest = Body(...)):
+    """
+    Submit business URL immediately after tool recommendations.
+
+    1. Stores the URL in the session
+    2. Detects URL type (website vs social profile)
+    3. Fires an async background crawl (does NOT block the response)
+    4. Returns immediately so the frontend can advance to Scale Questions
+
+    The crawl runs in parallel. Frontend polls /session/{id}/crawl-status
+    to check completion before starting Opus deep-dive questions.
+    """
+    session = session_store.get_session(body.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Normalize URL
+    url = body.business_url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    # Detect URL type
+    url_type = detect_url_type(url)
+
+    # Store in session
+    session_store.set_website_url(body.session_id, url, url_type)
+    session_store.set_crawl_status(body.session_id, "in_progress")
+
+    # Fire background crawl (non-blocking)
+    asyncio.create_task(run_background_crawl(body.session_id, url))
+
+    logger.info(
+        "Business URL submitted, background crawl started",
+        session_id=body.session_id,
+        url=url,
+        url_type=url_type,
+    )
+
+    return SubmitUrlResponse(
+        session_id=body.session_id,
+        business_url=url,
+        url_type=url_type,
+        crawl_started=True,
+        message="Analyzing your business in the background — let's continue!",
+    )
+
+
+@router.get("/session/{session_id}/crawl-status", response_model=CrawlStatusResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_DEFAULT)
+async def get_crawl_status(request: Request, session_id: str):
+    """
+    Poll crawl status. Frontend calls this to check if the background
+    crawl has completed before starting the Opus deep-dive questions.
+
+    Returns:
+      - crawl_status: "in_progress" | "complete" | "failed" | ""
+      - crawl_summary: populated only when status is "complete"
+    """
+    session = session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return CrawlStatusResponse(
+        session_id=session_id,
+        crawl_status=session.crawl_status or "",
+        crawl_summary=session.crawl_summary if session.crawl_status == "complete" else None,
+    )
+
+
+@router.post("/session/skip-url")
+@limiter.limit(lambda: get_settings().RATE_LIMIT_DEFAULT)
+async def skip_business_url(request: Request, body: dict = Body(...)):
+    """
+    User chose to skip URL submission.
+    Records the skip and allows flow to continue with generic recommendations.
+    """
+    session_id = body.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+
+    session = session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Mark as skipped — no crawl, no URL
+    session.website_url = None
+    session.crawl_status = "skipped"
+    session_store.update_session(session)
+
+    logger.info("User skipped URL submission", session_id=session_id)
+
+    return {
+        "session_id": session_id,
+        "message": "No problem — we'll give general recommendations instead of personalized ones.",
+    }
+
+
+@router.post("/session/website", response_model=WebsiteAnalysisResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_CHAT)
+async def submit_website(request: Request, body: SubmitWebsiteRequest = Body(...)):
+    """
+    Submit business website URL for audience analysis.
+
+    Called during Stage 2 of RCA. Fetches the website, analyzes
+    the content to determine:
+    - Who the business is targeting (intended audience)
+    - Who the content actually reaches (actual audience)
+    - Any mismatch between the two
+    - Actionable recommendations
+
+    This creates an 'aha' moment for the user — showing them
+    a gap they may not have been aware of.
+    """
+    session = session_store.get_session(body.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Store the website URL
+    session_store.set_website_url(body.session_id, body.website_url)
+
+    # Analyze the website for audience insights
+    try:
+        analysis = await agent_service.analyze_website_audience(
+            website_url=body.website_url,
+            outcome_label=session.outcome_label or "",
+            domain=session.domain or "",
+            task=session.task or "",
+            rca_history=session.rca_history,
+        )
+    except Exception as e:
+        logger.error(
+            "Website analysis failed",
+            session_id=body.session_id,
+            url=body.website_url,
+            error=str(e),
+        )
+        analysis = {
+            "intended_audience": "",
+            "actual_audience": "",
+            "mismatch_analysis": "We couldn't fully analyze this website right now, but we've noted it for your diagnostic.",
+            "recommendations": [],
+            "business_summary": "",
+        }
+
+    # Store insights in session
+    session_store.set_audience_insights(body.session_id, analysis)
+
+    audience_insights = AudienceInsight(
+        intended_audience=analysis.get("intended_audience", ""),
+        actual_audience=analysis.get("actual_audience", ""),
+        mismatch_analysis=analysis.get("mismatch_analysis", ""),
+        recommendations=analysis.get("recommendations", []),
+    )
+
+    logger.info(
+        "Website analysis complete",
+        session_id=body.session_id,
+        url=body.website_url,
+        has_mismatch=bool(analysis.get("mismatch_analysis")),
+    )
+
+    return WebsiteAnalysisResponse(
+        session_id=body.session_id,
+        website_url=body.website_url,
+        audience_insights=audience_insights,
+        business_summary=analysis.get("business_summary", ""),
+        analysis_note=(
+            "I've analyzed your website to understand your audience positioning. "
+            "This insight will help us refine your tool recommendations even further."
+        ),
+    )
