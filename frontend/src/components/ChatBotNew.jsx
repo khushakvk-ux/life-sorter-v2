@@ -1120,6 +1120,8 @@ const ChatBotNew = ({ onNavigate }) => {
   const [scaleQuestions, setScaleQuestions] = useState([]);
   const [currentScaleQIndex, setCurrentScaleQIndex] = useState(0);
   const scaleAnswersRef = useRef({}); // ref to avoid stale closures
+  const [scaleFormSelections, setScaleFormSelections] = useState({}); // {questionId: selectedOption}
+  const [scaleFormSubmitted, setScaleFormSubmitted] = useState(false);
 
   const API_BASE = import.meta.env.VITE_API_URL || '';
 
@@ -2219,16 +2221,16 @@ const ChatBotNew = ({ onNavigate }) => {
       setScaleQuestions(data.questions);
       setCurrentScaleQIndex(0);
       scaleAnswersRef.current = {};
+      setScaleFormSelections({});
+      setScaleFormSubmitted(false);
 
-      // Show intro message + first scale question
-      const firstQ = data.questions[0];
+      // Show single message with all scale questions as a form
       const introMsg = {
         id: getNextMessageId(),
-        text: `Before we dive deep, a few quick questions to understand your business context better. This helps me calibrate my diagnostic to your exact situation.\n\n${firstQ.icon} **${firstQ.question}**`,
+        text: `Before we dive deep, a few quick questions to understand your business context better.`,
         sender: 'bot',
         timestamp: new Date(),
-        showScaleQuestion: true,
-        scaleQuestionIndex: 0,
+        showScaleForm: true,
       };
       setMessages(prev => [...prev, introMsg]);
       setFlowStage('scale-questions');
@@ -2238,37 +2240,26 @@ const ChatBotNew = ({ onNavigate }) => {
     }
   };
 
-  const handleScaleAnswer = async (questionId, answer) => {
-    // Record user's choice
-    scaleAnswersRef.current[questionId] = answer;
+  const handleScaleFormSubmit = async () => {
+    // Validate all questions answered
+    const allAnswered = scaleQuestions.every(q => scaleFormSelections[q.id]);
+    if (!allAnswered) return;
 
-    // Show user's selection as a message
+    scaleAnswersRef.current = { ...scaleFormSelections };
+    setScaleFormSubmitted(true);
+
+    // Show summary as user message
+    const summaryLines = scaleQuestions.map(q => `${q.icon} ${scaleFormSelections[q.id]}`);
     const userMsg = {
       id: getNextMessageId(),
-      text: answer,
+      text: summaryLines.join('\n'),
       sender: 'user',
       timestamp: new Date(),
     };
     setMessages(prev => [...prev, userMsg]);
 
-    const nextIndex = currentScaleQIndex + 1;
-
-    if (nextIndex < scaleQuestions.length) {
-      // Show next scale question
-      const nextQ = scaleQuestions[nextIndex];
-      setCurrentScaleQIndex(nextIndex);
-
-      const nextMsg = {
-        id: getNextMessageId(),
-        text: `${nextQ.icon} **${nextQ.question}**`,
-        sender: 'bot',
-        timestamp: new Date(),
-        showScaleQuestion: true,
-        scaleQuestionIndex: nextIndex,
-      };
-      setMessages(prev => [...prev, nextMsg]);
-    } else {
-      // All scale questions answered — submit to backend + get context-aware first question
+    // Submit & transition to diagnostic
+    {
       setFlowStage('diagnostic');
       setIsTyping(true);
 
@@ -4379,52 +4370,94 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                       </div>
                     )}
 
-                    {/* Scale Questions — quick business context classification */}
-                    {message.showScaleQuestion && flowStage === 'scale-questions' && message.scaleQuestionIndex === currentScaleQIndex && scaleQuestions[currentScaleQIndex] && (
-                      <div className="scale-question-card" style={{
-                        marginTop: '1rem',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '0.5rem',
+                    {/* Scale Questions — all-at-once form */}
+                    {message.showScaleForm && flowStage === 'scale-questions' && !scaleFormSubmitted && scaleQuestions.length > 0 && (
+                      <div className="scale-form" style={{
+                        marginTop: '0.75rem',
+                        borderRadius: '16px',
+                        overflow: 'hidden',
+                        border: '1px solid rgba(124, 58, 237, 0.15)',
+                        background: 'var(--ikshan-bg-primary, #fff)',
+                        boxShadow: '0 4px 24px rgba(0,0,0,0.06)',
                       }}>
-                        {scaleQuestions[currentScaleQIndex].options.map((opt, i) => (
-                          <button
-                            key={i}
-                            onClick={() => handleScaleAnswer(scaleQuestions[currentScaleQIndex].id, opt)}
-                            style={{
-                              padding: '0.7rem 1rem',
-                              borderRadius: '10px',
-                              border: '1.5px solid rgba(124, 58, 237, 0.2)',
-                              background: 'linear-gradient(135deg, #fafaff 0%, #f5f0ff 100%)',
+                        {scaleQuestions.map((q, qIdx) => (
+                          <div key={q.id} style={{
+                            padding: '0.85rem 1.15rem',
+                            borderBottom: qIdx < scaleQuestions.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none',
+                          }}>
+                            <div style={{
+                              fontSize: '0.78rem',
+                              fontWeight: 600,
                               color: 'var(--ikshan-text-primary, #1a1a1a)',
+                              marginBottom: '0.5rem',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.4rem',
+                            }}>
+                              <span>{q.icon}</span>
+                              <span>{q.question}</span>
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                              {q.options.map((opt, oIdx) => {
+                                const isSelected = scaleFormSelections[q.id] === opt;
+                                return (
+                                  <button
+                                    key={oIdx}
+                                    onClick={() => setScaleFormSelections(prev => ({ ...prev, [q.id]: opt }))}
+                                    style={{
+                                      padding: '0.5rem 0.85rem',
+                                      borderRadius: '8px',
+                                      border: isSelected ? '1.5px solid #7c3aed' : '1.5px solid rgba(0,0,0,0.08)',
+                                      background: isSelected ? 'linear-gradient(135deg, #f0eaff 0%, #e8e0ff 100%)' : 'transparent',
+                                      color: 'var(--ikshan-text-primary, #1a1a1a)',
+                                      fontSize: '0.8rem',
+                                      fontWeight: isSelected ? 600 : 450,
+                                      cursor: 'pointer',
+                                      textAlign: 'left',
+                                      transition: 'all 0.15s ease',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: '0.5rem',
+                                    }}
+                                  >
+                                    <span style={{
+                                      width: '16px',
+                                      height: '16px',
+                                      borderRadius: '50%',
+                                      border: isSelected ? '5px solid #7c3aed' : '2px solid #d1d5db',
+                                      flexShrink: 0,
+                                      transition: 'all 0.15s ease',
+                                    }} />
+                                    {opt}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+
+                        {/* Submit button */}
+                        <div style={{ padding: '0.75rem 1.15rem', borderTop: '1px solid rgba(0,0,0,0.05)' }}>
+                          <button
+                            onClick={handleScaleFormSubmit}
+                            disabled={!scaleQuestions.every(q => scaleFormSelections[q.id])}
+                            style={{
+                              width: '100%',
+                              padding: '0.7rem',
+                              borderRadius: '10px',
+                              border: 'none',
+                              background: scaleQuestions.every(q => scaleFormSelections[q.id])
+                                ? 'linear-gradient(135deg, #7c3aed, #6d28d9)'
+                                : 'rgba(0,0,0,0.08)',
+                              color: scaleQuestions.every(q => scaleFormSelections[q.id]) ? '#fff' : '#9ca3af',
                               fontSize: '0.85rem',
-                              fontWeight: 500,
-                              cursor: 'pointer',
-                              textAlign: 'left',
-                              transition: 'all 0.15s ease',
-                              animationDelay: `${i * 0.04}s`,
-                            }}
-                            onMouseEnter={(e) => {
-                              e.target.style.borderColor = '#7c3aed';
-                              e.target.style.background = 'linear-gradient(135deg, #f0eaff 0%, #e8e0ff 100%)';
-                              e.target.style.transform = 'translateX(4px)';
-                            }}
-                            onMouseLeave={(e) => {
-                              e.target.style.borderColor = 'rgba(124, 58, 237, 0.2)';
-                              e.target.style.background = 'linear-gradient(135deg, #fafaff 0%, #f5f0ff 100%)';
-                              e.target.style.transform = 'translateX(0)';
+                              fontWeight: 600,
+                              cursor: scaleQuestions.every(q => scaleFormSelections[q.id]) ? 'pointer' : 'not-allowed',
+                              transition: 'all 0.2s ease',
                             }}
                           >
-                            {opt}
+                            Continue →
                           </button>
-                        ))}
-                        <div style={{
-                          marginTop: '0.25rem',
-                          fontSize: '0.75rem',
-                          color: 'var(--ikshan-text-secondary, #9ca3af)',
-                          textAlign: 'center',
-                        }}>
-                          {currentScaleQIndex + 1} of {scaleQuestions.length}
                         </div>
                       </div>
                     )}
