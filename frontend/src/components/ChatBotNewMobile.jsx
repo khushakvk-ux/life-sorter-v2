@@ -549,6 +549,11 @@ const ChatBotNewMobile = ({ onNavigate }) => {
   const [scaleFormSelections, setScaleFormSelections] = useState({});
   const [scaleFormSubmitted, setScaleFormSubmitted] = useState(false);
 
+  // ── Precision Questions State ──────────────────────────────
+  const [precisionQuestions, setPrecisionQuestions] = useState([]);
+  const [currentPrecisionQIndex, setCurrentPrecisionQIndex] = useState(0);
+  const pendingPrecisionDataRef = useRef(null);
+
   const API_BASE = import.meta.env.VITE_API_URL || '';
 
   // Helper: always get the latest session id (ref > state avoid React async gap)
@@ -1243,6 +1248,86 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     showSolutionStack(task);
   };
 
+  // ── Helper: proceed to report/auth after all questions done ──
+  const proceedToReport = async (rcaSummaryText, crawlPoints) => {
+    if (userEmail) {
+      await showDiagnosticReport(rcaSummaryText, crawlPoints);
+    } else {
+      pendingAuthActionRef.current = 'recommendations';
+      pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints };
+      const authMsg = {
+        id: getNextMessageId(),
+        text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
+        sender: 'bot',
+        timestamp: new Date(),
+        showAuthGate: true,
+      };
+      setMessages(prev => [...prev, authMsg]);
+      setFlowStage('auth-gate');
+    }
+  };
+
+  // ── Handle precision question answers ──
+  const handlePrecisionAnswer = async (answer) => {
+    const currentPQ = precisionQuestions[currentPrecisionQIndex];
+
+    const userMsg = {
+      id: getNextMessageId(),
+      text: answer,
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+
+    try {
+      const sid = getSessionId();
+      if (sid) {
+        await fetch(`${API_BASE}/api/v1/agent/session/answer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: sid,
+            question_index: 900 + currentPrecisionQIndex,
+            answer: `[${currentPQ?.type || 'precision'}] ${answer}`,
+          }),
+        });
+      }
+    } catch (e) {
+      console.log('Precision answer save failed (non-blocking)', e);
+    }
+
+    const nextIdx = currentPrecisionQIndex + 1;
+
+    if (nextIdx < precisionQuestions.length) {
+      setCurrentPrecisionQIndex(nextIdx);
+      const nextPQ = precisionQuestions[nextIdx];
+
+      const pqParts = [];
+      if (nextPQ.insight) pqParts.push(`💡 *${nextPQ.insight}*`);
+      pqParts.push(nextPQ.question);
+
+      const botMsg = {
+        id: getNextMessageId(),
+        text: `**${nextPQ.section_label || 'Precision Question'}**\n\n${pqParts.join('\n\n')}`,
+        sender: 'bot',
+        timestamp: new Date(),
+        diagnosticOptions: nextPQ.options || [],
+        sectionIndex: nextIdx,
+        sectionKey: `precision_${nextPQ.type}`,
+        allowsFreeText: true,
+        isPrecisionQuestion: true,
+        precisionIndex: nextIdx,
+      };
+      setMessages(prev => [...prev, botMsg]);
+    } else {
+      const pendingData = pendingPrecisionDataRef.current;
+      pendingPrecisionDataRef.current = null;
+      const rcaSummary = pendingData?.rcaSummary || '';
+      const crawlPoints = pendingData?.crawlPoints || [];
+      await proceedToReport(rcaSummary, crawlPoints);
+    }
+  };
+
   // Handle dynamic question answer (option click) — supports RCA & fallback
   const handleDynamicAnswer = async (answer) => {
     const currentQ = dynamicQuestions[currentDynamicQIndex];
@@ -1285,88 +1370,86 @@ const ChatBotNewMobile = ({ onNavigate }) => {
               ? `${data.acknowledgment}${data.rca_summary ? '\n\n' + data.rca_summary : ''}`
               : data.rca_summary || '';
 
-            // Check if crawl is still running
+            // Resolve crawl points
+            let crawlPoints = [];
             if (crawlStatus === 'in_progress') {
-              const waitMsg = {
-                id: getNextMessageId(),
-                text: `Putting together your diagnostic report... ⏳`,
-                sender: 'bot',
-                timestamp: new Date(),
-                isCrawlWaiting: true,
-              };
-              setMessages(prev => [...prev, waitMsg]);
-              setFlowStage('crawl-waiting');
-
-              const waitForCrawl = setInterval(async () => {
-                try {
-                  const sid = getSessionId();
-                  const res = await fetch(`${API_BASE}/api/v1/agent/session/${sid}/crawl-status`);
-                  const statusData = await res.json();
-                  if (statusData.crawl_status === 'complete' || statusData.crawl_status === 'failed') {
-                    setCrawlStatus(statusData.crawl_status);
-                    clearInterval(waitForCrawl);
-
-                    const crawlPoints = (statusData.crawl_status === 'complete' && statusData.crawl_summary?.points)
-                      ? statusData.crawl_summary.points : [];
-
-                    if (userEmail) {
-                      await showDiagnosticReport(rcaSummaryText, crawlPoints);
-                    } else {
-                      pendingAuthActionRef.current = 'recommendations';
-                      pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints };
-                      const authMsg = {
-                        id: getNextMessageId(),
-                        text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
-                        sender: 'bot',
-                        timestamp: new Date(),
-                        showAuthGate: true,
-                      };
-                      setMessages(prev => [...prev, authMsg]);
-                      setFlowStage('auth-gate');
+              crawlPoints = await new Promise((resolve) => {
+                const waitForCrawl = setInterval(async () => {
+                  try {
+                    const sid = getSessionId();
+                    const statusRes = await fetch(`${API_BASE}/api/v1/agent/session/${sid}/crawl-status`);
+                    const statusData = await statusRes.json();
+                    if (statusData.crawl_status === 'complete' || statusData.crawl_status === 'failed') {
+                      setCrawlStatus(statusData.crawl_status);
+                      clearInterval(waitForCrawl);
+                      const pts = (statusData.crawl_status === 'complete' && statusData.crawl_summary?.points)
+                        ? statusData.crawl_summary.points : [];
+                      resolve(pts);
                     }
+                  } catch (e) {
+                    console.log('Crawl wait poll failed', e);
+                    clearInterval(waitForCrawl);
+                    resolve([]);
                   }
-                } catch (e) {
-                  console.log('Crawl wait poll failed', e);
-                  clearInterval(waitForCrawl);
-                  if (userEmail) {
-                    await showDiagnosticReport(rcaSummaryText, []);
-                  } else {
-                    pendingAuthActionRef.current = 'recommendations';
-                    pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints: [] };
-                    const authMsg = {
-                      id: getNextMessageId(),
-                      text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
-                      sender: 'bot',
-                      timestamp: new Date(),
-                      showAuthGate: true,
-                    };
-                    setMessages(prev => [...prev, authMsg]);
-                    setFlowStage('auth-gate');
-                  }
-                }
-              }, 2000);
-              return;
-            }
-
-            // Crawl complete or skipped
-            const crawlPoints = crawlSummaryRef.current?.points || [];
-            crawlSummaryRef.current = null;
-
-            if (userEmail) {
-              await showDiagnosticReport(rcaSummaryText, crawlPoints);
+                }, 2000);
+              });
             } else {
-              pendingAuthActionRef.current = 'recommendations';
-              pendingReportDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints };
-              const authMsg = {
-                id: getNextMessageId(),
-                text: `Your diagnostic is ready.\n\nSign in to unlock your **personalized report & tool recommendations**.`,
-                sender: 'bot',
-                timestamp: new Date(),
-                showAuthGate: true,
-              };
-              setMessages(prev => [...prev, authMsg]);
-              setFlowStage('auth-gate');
+              crawlPoints = crawlSummaryRef.current?.points || [];
+              crawlSummaryRef.current = null;
             }
+
+            // Try to fetch precision questions
+            setIsTyping(true);
+            try {
+              const sid = getSessionId();
+              const precRes = await fetch(`${API_BASE}/api/v1/agent/session/precision-questions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sid }),
+              });
+              const precData = await precRes.json();
+
+              if (precData.available && precData.questions && precData.questions.length > 0) {
+                setIsTyping(false);
+                setPrecisionQuestions(precData.questions);
+                setCurrentPrecisionQIndex(0);
+                pendingPrecisionDataRef.current = { rcaSummary: rcaSummaryText, crawlPoints };
+                setFlowStage('precision-questions');
+
+                const transMsg = {
+                  id: getNextMessageId(),
+                  text: `I've cross-referenced your answers with what I found on your website. I have **3 precision questions** that dig into the gaps I spotted.`,
+                  sender: 'bot',
+                  timestamp: new Date(),
+                };
+
+                const pq = precData.questions[0];
+                const pqParts = [];
+                if (pq.insight) pqParts.push(`💡 *${pq.insight}*`);
+                pqParts.push(pq.question);
+
+                const pqMsg = {
+                  id: getNextMessageId(),
+                  text: `**${pq.section_label || 'Precision Question'}**\n\n${pqParts.join('\n\n')}`,
+                  sender: 'bot',
+                  timestamp: new Date(),
+                  diagnosticOptions: pq.options || [],
+                  sectionIndex: 0,
+                  sectionKey: `precision_${pq.type}`,
+                  allowsFreeText: true,
+                  isPrecisionQuestion: true,
+                  precisionIndex: 0,
+                };
+
+                setMessages(prev => [...prev, transMsg, pqMsg]);
+                return;
+              }
+            } catch (e) {
+              console.log('Precision questions failed, proceeding to report', e);
+            }
+
+            setIsTyping(false);
+            await proceedToReport(rcaSummaryText, crawlPoints);
             return;
           }
 
@@ -3741,7 +3824,58 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                   {/* Diagnostic Section Options — in-chat */}
                   {message.diagnosticOptions && message.diagnosticOptions.length > 0 && (
                     <div className="diagnostic-options" style={{ marginTop: '1rem' }}>
-                      {message.sectionIndex === currentDynamicQIndex ? (
+                      {/* Precision questions */}
+                      {message.isPrecisionQuestion ? (
+                        message.precisionIndex === currentPrecisionQIndex && flowStage === 'precision-questions' ? (
+                          <>
+                            {message.diagnosticOptions.map((opt, i) => (
+                              <button
+                                key={i}
+                                className="diagnostic-option-btn"
+                                onClick={() => !isTyping && handlePrecisionAnswer(opt)}
+                                disabled={isTyping}
+                                style={{
+                                  animationDelay: `${i * 0.04}s`,
+                                  opacity: isTyping ? 0.5 : undefined,
+                                  pointerEvents: isTyping ? 'none' : undefined,
+                                }}
+                              >
+                                {opt}
+                              </button>
+                            ))}
+                            {message.allowsFreeText && (
+                              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
+                                <input
+                                  type="text"
+                                  value={dynamicFreeText}
+                                  onChange={(e) => setDynamicFreeText(e.target.value)}
+                                  onKeyPress={(e) => {
+                                    if (e.key === 'Enter' && dynamicFreeText.trim()) {
+                                      handlePrecisionAnswer(dynamicFreeText.trim());
+                                      setDynamicFreeText('');
+                                    }
+                                  }}
+                                  placeholder="Or describe your own..."
+                                  className="diagnostic-free-input"
+                                />
+                                <button
+                                  onClick={() => { if (dynamicFreeText.trim()) { handlePrecisionAnswer(dynamicFreeText.trim()); setDynamicFreeText(''); } }}
+                                  disabled={!dynamicFreeText.trim()}
+                                  className="diagnostic-free-submit"
+                                >
+                                  &rarr;
+                                </button>
+                              </div>
+                            )}
+                          </>
+                        ) : (
+                          <p style={{ color: 'var(--ikshan-text-secondary, #6b7280)', fontSize: '0.85rem', fontStyle: 'italic', marginTop: '0.5rem' }}>
+                            &#10003; Answered
+                          </p>
+                        )
+                      ) : (
+                      /* Regular diagnostic questions */
+                      message.sectionIndex === currentDynamicQIndex ? (
                         <>
                           {message.diagnosticOptions.map((opt, i) => (
                             <button
@@ -3786,6 +3920,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                         <p style={{ color: 'var(--ikshan-text-secondary, #6b7280)', fontSize: '0.85rem', fontStyle: 'italic', marginTop: '0.5rem' }}>
                           &#10003; Answered
                         </p>
+                      )
                       )}
                     </div>
                   )}

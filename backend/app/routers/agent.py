@@ -27,7 +27,7 @@ from app.middleware.rate_limit import limiter
 from app.services import session_store, agent_service
 from app.services.crawl_service import detect_url_type, run_background_crawl
 from app.services.persona_doc_service import get_available_personas, get_doc_for_domain, get_diagnostic_sections
-from app.services.claude_rca_service import generate_next_rca_question
+from app.services.claude_rca_service import generate_next_rca_question, generate_precision_questions
 from app.models.session import (
     SessionStage,
     GenerateDynamicQuestionsRequest,
@@ -448,6 +448,89 @@ async def start_diagnostic(request: Request, body: StartDiagnosticRequest = Body
     return StartDiagnosticResponse(
         session_id=session.session_id,
         rca_mode=False,
+    )
+
+
+# ── Precision Questions (Crawl × Answers cross-reference) ─────
+
+class PrecisionQuestionItem(BaseModel):
+    type: str                   # contradiction, blind_spot, unlock
+    insight: str = ""
+    question: str
+    options: list[str] = []
+    section_label: str = ""
+
+class PrecisionQuestionsRequest(BaseModel):
+    session_id: str
+
+class PrecisionQuestionsResponse(BaseModel):
+    session_id: str
+    questions: list[PrecisionQuestionItem] = []
+    available: bool = False     # True if questions were generated
+
+
+@router.post("/session/precision-questions", response_model=PrecisionQuestionsResponse)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_CHAT)
+async def get_precision_questions(request: Request, body: PrecisionQuestionsRequest = Body(...)):
+    """
+    Generate 3 precision questions that cross-reference crawl data with
+    the user's diagnostic answers to find contradictions, blind spots,
+    and unlock opportunities.
+    """
+    session = session_store.get_session(body.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Need crawl data OR answers to generate precision questions
+    has_crawl = bool(session.crawl_summary and session.crawl_summary.get("points"))
+    has_answers = bool(session.rca_history)
+
+    if not has_answers:
+        return PrecisionQuestionsResponse(
+            session_id=session.session_id,
+            questions=[],
+            available=False,
+        )
+
+    result = await generate_precision_questions(
+        outcome=session.outcome or "",
+        outcome_label=session.outcome_label or "",
+        domain=session.domain or "",
+        task=session.task or "",
+        rca_history=session.rca_history,
+        crawl_summary=session.crawl_summary or None,
+        crawl_raw=session.crawl_raw or None,
+        business_profile=session.business_profile or None,
+    )
+
+    if not result:
+        return PrecisionQuestionsResponse(
+            session_id=session.session_id,
+            questions=[],
+            available=False,
+        )
+
+    questions = [
+        PrecisionQuestionItem(
+            type=q.get("type", "unknown"),
+            insight=q.get("insight", ""),
+            question=q.get("question", ""),
+            options=q.get("options", []),
+            section_label=q.get("section_label", ""),
+        )
+        for q in result
+    ]
+
+    logger.info(
+        "Precision questions ready",
+        session_id=session.session_id,
+        count=len(questions),
+    )
+
+    return PrecisionQuestionsResponse(
+        session_id=session.session_id,
+        questions=questions,
+        available=True,
     )
 
 

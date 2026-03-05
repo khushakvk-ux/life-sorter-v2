@@ -418,3 +418,237 @@ async def generate_next_rca_question(
     except httpx.RequestError as e:
         logger.error("OpenRouter request failed", error=str(e))
         return None
+
+
+# ══════════════════════════════════════════════════════════════
+# PRECISION QUESTIONS — Crawl Data × User Answers Cross-Ref
+# ══════════════════════════════════════════════════════════════
+
+PRECISION_SYSTEM_PROMPT = """\
+You are an expert business diagnostician. You have two data sources:
+
+SOURCE A — WEBSITE CRAWL DATA (what their site actually shows):
+{crawl_points}
+{crawl_detailed}
+
+SOURCE B — USER'S OWN DIAGNOSTIC ANSWERS (what they told us):
+{user_answers}
+
+SOURCE C — BUSINESS CONTEXT:
+{business_context}
+
+YOUR JOB:
+Generate exactly 3 precision questions by cross-referencing Source A and Source B.
+These are NOT repeat questions. These find the GAPS BETWEEN the two sources.
+
+QUESTION 1 — THE CONTRADICTION:
+Find a place where what the website shows CONFLICTS with what the user said.
+If no clear contradiction exists, find the biggest DISCONNECT between their \
+stated priorities and what the website communicates.
+
+QUESTION 2 — THE BLIND SPOT:
+Find something important in the crawl data that the user NEVER mentioned \
+in any of their answers. This should be something that directly impacts \
+their stated goal.
+
+QUESTION 3 — THE UNLOCK:
+Connect one of the user's stated strengths (from their answers) with a \
+specific gap found in the crawl. Frame it as an opportunity, not a problem.
+
+FORMAT RULES:
+- Each question follows the knowledge-embedded pattern: Lead with insight, then ask.
+- Each question: 40-70 words total (insight + question combined).
+- Be hyper-specific. Reference exact pages, exact missing elements, \
+  exact things the user said. No vague "your site could be better."
+- If the crawl found nothing interesting for a category, use the \
+  user's answers alone to find internal contradictions.
+- Each question must have 3-5 answer options. Always include "Something else" as last.
+
+═══ RESPONSE FORMAT ═══
+
+Respond in valid JSON only:
+{
+  "questions": [
+    {
+      "type": "contradiction",
+      "insight": "Max 10-12 words — the key finding that creates the 'wait, what?' moment",
+      "question": "40-70 word question that asks them to reconcile the gap",
+      "options": ["Specific scenario A", "Specific scenario B", "Specific scenario C", "Something else"],
+      "section_label": "The Contradiction"
+    },
+    {
+      "type": "blind_spot",
+      "insight": "Max 10-12 words — what you found that they missed",
+      "question": "40-70 word question about something they seem unaware of",
+      "options": ["Specific scenario A", "Specific scenario B", "Specific scenario C", "Something else"],
+      "section_label": "The Blind Spot"
+    },
+    {
+      "type": "unlock",
+      "insight": "Max 10-12 words — the hidden opportunity connection",
+      "question": "40-70 word question framing the opportunity",
+      "options": ["Specific scenario A", "Specific scenario B", "Specific scenario C", "Something else"],
+      "section_label": "The Unlock"
+    }
+  ]
+}
+"""
+
+
+def _build_precision_context(
+    outcome: str,
+    outcome_label: str,
+    domain: str,
+    task: str,
+    rca_history: list[dict[str, str]],
+    crawl_summary: dict[str, Any] | None = None,
+    crawl_raw: dict[str, Any] | None = None,
+    business_profile: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Build system prompt (with data injected) and user message for precision questions."""
+
+    # Build crawl points string
+    crawl_points_str = "No crawl data available."
+    if crawl_summary and crawl_summary.get("points"):
+        crawl_points_str = "\n".join(f"  • {pt}" for pt in crawl_summary["points"])
+
+    # Build crawl detailed string from raw data
+    crawl_detailed_str = ""
+    if crawl_raw:
+        details = []
+        if crawl_raw.get("homepage"):
+            hp = crawl_raw["homepage"]
+            if hp.get("title"):
+                details.append(f"Page title: {hp['title']}")
+            if hp.get("meta_description"):
+                details.append(f"Meta description: {hp['meta_description']}")
+        if crawl_raw.get("tech_signals"):
+            details.append(f"Tech detected: {', '.join(crawl_raw['tech_signals'][:10])}")
+        if crawl_raw.get("pages_crawled"):
+            page_urls = [p.get("url", "") for p in crawl_raw["pages_crawled"][:8]]
+            details.append(f"Pages found: {', '.join(page_urls)}")
+        crawl_detailed_str = "\n".join(details) if details else "No detailed crawl data."
+
+    # Build user answers string
+    user_answers_str = "No diagnostic answers yet."
+    if rca_history:
+        lines = []
+        for i, qa in enumerate(rca_history, 1):
+            lines.append(f"  Q{i}: {qa['question']}")
+            lines.append(f"  A{i}: {qa['answer']}")
+        user_answers_str = "\n".join(lines)
+
+    # Build business context string
+    ctx_parts = [
+        f"Goal: {outcome_label}",
+        f"Domain: {domain}",
+        f"Task: {task}",
+    ]
+    if business_profile:
+        for key, value in business_profile.items():
+            ctx_parts.append(f"  {key.replace('_', ' ').title()}: {value}")
+    business_context_str = "\n".join(ctx_parts)
+
+    # Inject into system prompt
+    system = PRECISION_SYSTEM_PROMPT.replace("{crawl_points}", crawl_points_str)
+    system = system.replace("{crawl_detailed}", crawl_detailed_str)
+    system = system.replace("{user_answers}", user_answers_str)
+    system = system.replace("{business_context}", business_context_str)
+
+    user_msg = (
+        "Generate exactly 3 precision questions based on the data above. "
+        "Cross-reference the crawl findings with the user's answers. "
+        "Find contradictions, blind spots, and unlock opportunities."
+    )
+
+    return system, user_msg
+
+
+async def generate_precision_questions(
+    outcome: str,
+    outcome_label: str,
+    domain: str,
+    task: str,
+    rca_history: list[dict[str, str]],
+    crawl_summary: dict[str, Any] | None = None,
+    crawl_raw: dict[str, Any] | None = None,
+    business_profile: dict[str, str] | None = None,
+) -> list[dict[str, Any]] | None:
+    """
+    Generate 3 precision questions that cross-reference crawl data with user answers.
+    Returns a list of 3 question dicts, or None on failure.
+    """
+    settings = get_settings()
+    api_key = settings.OPENROUTER_API_KEY
+    model = settings.OPENROUTER_MODEL
+
+    if not api_key:
+        logger.warning("OpenRouter API key not configured — skipping precision questions")
+        return None
+
+    # If no crawl data and no answers, skip
+    if not rca_history:
+        logger.info("No RCA history — skipping precision questions")
+        return None
+
+    system_prompt, user_content = _build_precision_context(
+        outcome, outcome_label, domain, task, rca_history,
+        crawl_summary=crawl_summary,
+        crawl_raw=crawl_raw,
+        business_profile=business_profile,
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1200,
+        "response_format": {"type": "json_object"},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://ikshan.ai",
+        "X-Title": "Ikshan Precision Questions",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                OPENROUTER_CHAT_URL, json=payload, headers=headers
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        content = data["choices"][0]["message"]["content"]
+        result = json.loads(content)
+
+        questions = result.get("questions", [])
+        if not questions or len(questions) < 1:
+            logger.error("Precision questions: empty or missing", raw=content[:300])
+            return None
+
+        logger.info(
+            "Precision questions generated",
+            count=len(questions),
+            types=[q.get("type", "?") for q in questions],
+        )
+        return questions[:3]  # Ensure max 3
+
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "Precision questions HTTP error",
+            status_code=e.response.status_code,
+            body=e.response.text[:300],
+        )
+        return None
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        logger.error("Precision questions parse error", error=str(e))
+        return None
+    except httpx.RequestError as e:
+        logger.error("Precision questions request failed", error=str(e))
+        return None
