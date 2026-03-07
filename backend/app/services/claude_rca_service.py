@@ -104,18 +104,24 @@ Every question you generate has THREE parts:
    read an option and think "oh yeah, that's exactly what happens." \
    Always include "Something else" as the last option.
 
-═══ QUESTION FLOW — PROGRESSIVE DEPTH ═══
+═══ QUESTION FLOW — PROGRESSIVE DEPTH (3 questions, max 4) ═══
+
+You have exactly 3 questions to diagnose the root cause. Make every one count.
+If absolutely necessary, you may ask a 4th — but treat that as the exception,
+not the norm. 3 questions is the target.
 
 - RCA-Q1: Surface the visible pain (what's not working) — use a broad \
-  pattern or benchmark to frame why this pain is common.
+  pattern or benchmark to frame why this pain is common. Teach them WHY \
+  this is a pattern, not just that it exists.
 - RCA-Q2: Probe the behavior behind it — teach them what the underlying \
-  driver usually is in businesses like theirs.
-- RCA-Q3: Uncover the systemic gap — reference a framework or best practice \
-  that top performers use (which the user likely doesn't have).
-- RCA-Q4: Validate with a sharper diagnostic — share a counter-intuitive \
-  insight that reframes their problem.
-- RCA-Q5: Power-move question — give them an "aha" moment. This is the \
-  question that makes them realize the root cause themselves.
+  driver usually is in businesses like theirs. This is where you start \
+  narrowing from symptom to root cause.
+- RCA-Q3: Power-move question — this is your closer. Share a counter-intuitive \
+  insight or reference a framework that makes them realize the root cause \
+  themselves. This question should create the "aha" moment.
+- RCA-Q4 (ONLY if essential): If Q1-Q3 were insufficient to pinpoint the exact \
+  root cause — e.g., the user gave ambiguous answers or the problem has multiple \
+  layers — you may ask one final sharpening question. Otherwise, signal complete.
 
 Use the RCA bridge data to map symptoms → root causes. When you know the \
 root-cause area (e.g., "Execution/Production" or "QA/Review/Controls"), \
@@ -152,9 +158,11 @@ Reference their scale naturally — "At your stage…" / "For a team of your siz
 
 1. ONE question per response. No exceptions.
 2. 3-6 answer options per question. Always include "Something else" as the last.
-3. You must ask a MINIMUM of 3 diagnostic questions. Aim for 4. \
+3. You must ask EXACTLY 3 diagnostic questions. That is the target. \
    Do NOT signal "complete" before asking at least 3 questions. \
-   After 4 questions you MUST signal completion. Absolute max is 5. \
+   After 3 questions, you SHOULD signal completion unless the answers were \
+   genuinely ambiguous and you need ONE more question to pinpoint the root cause. \
+   Absolute maximum is 4 questions — after 4, you MUST signal completion. \
    The user's earlier Q1 (outcome), Q2 (domain), Q3 (task) do NOT count — \
    your count starts from YOUR first diagnostic question.
 4. Every option must be a specific, recognizable scenario (not generic labels).
@@ -304,7 +312,7 @@ def _build_user_context(
         for i, qa in enumerate(rca_history, 1):
             parts.append(f"  RCA-Q{i}: {qa['question']}")
             parts.append(f"  RCA-A{i}: {qa['answer']}")
-        remaining = max(0, 4 - len(rca_history))
+        remaining = max(0, 3 - len(rca_history))
         if remaining > 0:
             parts.append(
                 f"\n→ You have asked {len(rca_history)} diagnostic question(s). "
@@ -312,12 +320,19 @@ def _build_user_context(
                 "Generate the NEXT question. Build on their answers. Drill deeper. "
                 "REMEMBER: The 'insight' field is MANDATORY — teach them something from the knowledge base above."
             )
+        elif len(rca_history) == 3:
+            parts.append(
+                "\n→ You have asked 3 questions — that is the TARGET number. "
+                "You SHOULD now signal 'complete' with a strong summary. "
+                "ONLY ask a 4th question if the answers were genuinely ambiguous "
+                "and you cannot pinpoint the root cause without one more question. "
+                "The 'insight' field is still MANDATORY for any question you ask."
+            )
         else:
             parts.append(
-                "\n→ Generate the NEXT question. Build on their answers. "
-                "Drill deeper into the root cause. If you have enough info "
-                "you may signal 'complete', or ask one more to sharpen the diagnosis. "
-                "The 'insight' field is still MANDATORY for any question you ask."
+                "\n→ You have asked 4 questions — that is the ABSOLUTE MAXIMUM. "
+                "You MUST signal 'complete' NOW with a powerful summary. "
+                "Do NOT ask another question."
             )
     else:
         parts.append(

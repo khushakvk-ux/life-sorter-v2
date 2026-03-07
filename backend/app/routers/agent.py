@@ -76,6 +76,9 @@ class EarlyToolRecommendation(BaseModel):
     category: str = ""       # 'extension', 'gpt', 'company'
     rating: Optional[str] = None
     why_relevant: str = ""   # Brief relevance note based on Q1-Q3
+    implementation_stage: str = ""   # When to implement in their workflow
+    issue_solved: str = ""           # What issue this tool addresses
+    ease_of_use: str = ""            # How easy to adopt given current process
 
 
 class SetTaskResponse(BaseModel):
@@ -232,6 +235,9 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
                         category=t.get("category", ""),
                         rating=t.get("rating"),
                         why_relevant=t.get("why_relevant", ""),
+                        implementation_stage=t.get("implementation_stage", ""),
+                        issue_solved=t.get("issue_solved", ""),
+                        ease_of_use=t.get("ease_of_use", ""),
                     )
                     for t in early_result["tools"]
                 ]
@@ -719,6 +725,9 @@ async def get_recommendations(request: Request, body: GetRecommendationsRequest 
             category="extension",
             free=ext.get("free"),
             why_recommended=ext.get("why_recommended", ""),
+            implementation_stage=ext.get("implementation_stage", ""),
+            issue_solved=ext.get("issue_solved", ""),
+            ease_of_use=ext.get("ease_of_use", ""),
         )
         for ext in recs.get("extensions", [])
     ]
@@ -731,6 +740,9 @@ async def get_recommendations(request: Request, body: GetRecommendationsRequest 
             category="gpt",
             rating=gpt.get("rating"),
             why_recommended=gpt.get("why_recommended", ""),
+            implementation_stage=gpt.get("implementation_stage", ""),
+            issue_solved=gpt.get("issue_solved", ""),
+            ease_of_use=gpt.get("ease_of_use", ""),
         )
         for gpt in recs.get("gpts", [])
     ]
@@ -742,6 +754,9 @@ async def get_recommendations(request: Request, body: GetRecommendationsRequest 
             url=co.get("url"),
             category="company",
             why_recommended=co.get("why_recommended", ""),
+            implementation_stage=co.get("implementation_stage", ""),
+            issue_solved=co.get("issue_solved", ""),
+            ease_of_use=co.get("ease_of_use", ""),
         )
         for co in recs.get("companies", [])
     ]

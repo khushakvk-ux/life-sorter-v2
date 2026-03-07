@@ -282,6 +282,10 @@ IMPORTANT:
 - Select 3-5 tools maximum that are most broadly relevant
 - Keep 'why_relevant' brief (1 sentence) — these are preliminary picks
 - Classify each as 'extension', 'gpt', or 'company' based on its source
+- For EACH tool, also provide:
+  • 'implementation_stage': When in their workflow to adopt this tool (e.g., "Day 1 — Start using immediately", "Week 1 — After setting up your content calendar", "Ongoing — Use during weekly review")
+  • 'issue_solved': What specific problem this tool addresses for their goal+domain+task (1 sentence, concrete)
+  • 'ease_of_use': How easy it is to integrate with their current process (e.g., "Plug & play — no setup needed", "15-min setup, works alongside your current tools", "Requires migrating existing data — but worth it")
 
 OUTPUT FORMAT (strict JSON):
 {{
@@ -292,7 +296,10 @@ OUTPUT FORMAT (strict JSON):
       "url": "exact URL from RAG results",
       "category": "extension|gpt|company",
       "rating": "from RAG results if available",
-      "why_relevant": "1 sentence: why this fits their goal+domain+task"
+      "why_relevant": "1 sentence: why this fits their goal+domain+task",
+      "implementation_stage": "When to adopt this tool in their workflow",
+      "issue_solved": "What specific problem this addresses",
+      "ease_of_use": "How easy to integrate with current process"
     }}
   ],
   "message": "A 2-3 sentence message: present these tools as a starting point, then \
@@ -689,6 +696,17 @@ CRITICAL RULES:
 - Prioritize tools with higher relevance scores
 - Prioritize free/freemium tools when the user seems budget-conscious
 - Recommend 2-6 items per category (only include categories that have results)
+- For EACH tool, you MUST also provide:
+  • 'implementation_stage': WHEN in the user's workflow they should adopt this tool. Be specific — \
+    reference their actual situation from the Q&A. Examples: "Day 1 — Start using before your next post", \
+    "Week 1 — After auditing your current lead flow", "Month 1 — Once your content calendar is set up", \
+    "Ongoing — Use during weekly performance reviews"
+  • 'issue_solved': What SPECIFIC problem from the diagnostic this tool solves. Connect it directly \
+    to something the user said or a root cause identified. Not generic — tie it to THEIR situation.
+  • 'ease_of_use': How easy it is to adopt given THEIR current process and tools. Be honest — \
+    if it requires learning, say so. Examples: "Plug & play — works in your browser, no setup", \
+    "30-min initial setup, then integrates with your existing workflow", \
+    "Requires migrating from spreadsheets — 2-3 hours initially, saves 5+ hrs/week after"
 
 OUTPUT FORMAT (strict JSON):
 {{
@@ -700,7 +718,10 @@ OUTPUT FORMAT (strict JSON):
       "free": true,
       "rating": "from RAG results if available",
       "installs": "from RAG results if available",
-      "why_recommended": "Specific reason based on user's answers, domain, and task"
+      "why_recommended": "Specific reason based on user's answers, domain, and task",
+      "implementation_stage": "When in workflow to adopt (e.g., Day 1, Week 1, Month 1, Ongoing)",
+      "issue_solved": "What specific diagnosed problem this tool fixes",
+      "ease_of_use": "How easy to adopt given their current setup"
     }}
   ],
   "gpts": [
@@ -709,7 +730,10 @@ OUTPUT FORMAT (strict JSON):
       "description": "What it does",
       "url": "exact URL from RAG results",
       "rating": "from RAG results if available",
-      "why_recommended": "Specific reason based on user's answers"
+      "why_recommended": "Specific reason based on user's answers",
+      "implementation_stage": "When in workflow to adopt",
+      "issue_solved": "What specific problem this addresses",
+      "ease_of_use": "How easy to integrate"
     }}
   ],
   "companies": [
@@ -717,7 +741,10 @@ OUTPUT FORMAT (strict JSON):
       "name": "Exact company/tool name from RAG results",
       "description": "What they do",
       "url": "exact URL from RAG results",
-      "why_recommended": "Specific reason based on user's answers"
+      "why_recommended": "Specific reason based on user's answers",
+      "implementation_stage": "When in workflow to adopt",
+      "issue_solved": "What specific problem this addresses",
+      "ease_of_use": "How easy to integrate"
     }}
   ],
   "summary": "A 2-3 sentence personalized summary of why these tools were selected for this user's specific situation"

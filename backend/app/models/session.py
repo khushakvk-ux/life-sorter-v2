@@ -165,6 +165,9 @@ class ToolRecommendation(BaseModel):
     free: Optional[bool] = None
     rating: Optional[str] = None
     why_recommended: str = ""
+    implementation_stage: str = ""   # When in their workflow to implement (e.g., "Day 1 — Immediate", "Week 2 — After auditing current process")
+    issue_solved: str = ""           # What specific problem from RCA this tool addresses
+    ease_of_use: str = ""            # How easy to adopt with current process (e.g., "Plug & play — no learning curve", "30-min setup, works with your existing tools")
 
 
 class GetRecommendationsResponse(BaseModel):

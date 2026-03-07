@@ -4402,6 +4402,37 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                   {tool.why_relevant}
                                 </p>
                               )}
+                              {/* Enriched tool context: issue solved, stage, ease */}
+                              {(tool.issue_solved || tool.implementation_stage || tool.ease_of_use) && (
+                                <div style={{
+                                  marginTop: '0.5rem',
+                                  padding: '0.5rem 0.6rem',
+                                  background: 'rgba(124, 58, 237, 0.04)',
+                                  borderRadius: '8px',
+                                  fontSize: '0.75rem',
+                                  lineHeight: 1.5,
+                                  color: 'var(--ikshan-text-secondary, #4b5563)',
+                                }}>
+                                  {tool.issue_solved && (
+                                    <div style={{ marginBottom: '0.25rem' }}>
+                                      <span style={{ fontWeight: 600, color: '#059669' }}>🎯 Solves: </span>
+                                      {tool.issue_solved}
+                                    </div>
+                                  )}
+                                  {tool.implementation_stage && (
+                                    <div style={{ marginBottom: '0.25rem' }}>
+                                      <span style={{ fontWeight: 600, color: '#3b82f6' }}>📅 When: </span>
+                                      {tool.implementation_stage}
+                                    </div>
+                                  )}
+                                  {tool.ease_of_use && (
+                                    <div>
+                                      <span style={{ fontWeight: 600, color: '#f59e0b' }}>⚡ Ease: </span>
+                                      {tool.ease_of_use}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
                               {tool.category && (
                                 <span style={{
                                   display: 'inline-block',
@@ -4699,6 +4730,13 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                   {tool.why_recommended && (
                                     <div className="report-tool-why">{tool.why_recommended}</div>
                                   )}
+                                  {(tool.issue_solved || tool.implementation_stage || tool.ease_of_use) && (
+                                    <div className="report-tool-context">
+                                      {tool.issue_solved && <div className="report-tool-context-row"><span className="ctx-label solves">🎯 Solves:</span> {tool.issue_solved}</div>}
+                                      {tool.implementation_stage && <div className="report-tool-context-row"><span className="ctx-label when">📅 When:</span> {tool.implementation_stage}</div>}
+                                      {tool.ease_of_use && <div className="report-tool-context-row"><span className="ctx-label ease">⚡ Ease:</span> {tool.ease_of_use}</div>}
+                                    </div>
+                                  )}
                                   {tool.url && <span className="report-tool-arrow">→</span>}
                                 </div>
                               ))}
@@ -4725,6 +4763,13 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                       </div>
                                       {tool.why_recommended && (
                                         <div className="report-tool-why">{tool.why_recommended}</div>
+                                      )}
+                                      {(tool.issue_solved || tool.implementation_stage || tool.ease_of_use) && (
+                                        <div className="report-tool-context">
+                                          {tool.issue_solved && <div className="report-tool-context-row"><span className="ctx-label solves">🎯 Solves:</span> {tool.issue_solved}</div>}
+                                          {tool.implementation_stage && <div className="report-tool-context-row"><span className="ctx-label when">📅 When:</span> {tool.implementation_stage}</div>}
+                                          {tool.ease_of_use && <div className="report-tool-context-row"><span className="ctx-label ease">⚡ Ease:</span> {tool.ease_of_use}</div>}
+                                        </div>
                                       )}
                                       {tool.url && <span className="report-tool-arrow">→</span>}
                                     </div>

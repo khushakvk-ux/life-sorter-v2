@@ -1285,6 +1285,32 @@
   min-width: 0;
 }
 
+/* Tool context enrichment — issue solved, stage, ease */
+.report-tool-context {
+  margin-top: 0.35rem;
+  padding: 0.4rem 0.5rem;
+  background: rgba(124, 58, 237, 0.03);
+  border-radius: 6px;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--ikshan-text-secondary, #4b5563);
+}
+.report-tool-context-row {
+  margin-bottom: 0.12rem;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+}
+.report-tool-context-row:last-child {
+  margin-bottom: 0;
+}
+.ctx-label {
+  font-weight: 600;
+}
+.ctx-label.solves { color: #059669; }
+.ctx-label.when   { color: #3b82f6; }
+.ctx-label.ease   { color: #d97706; }
+
 .report-tool-arrow {
   font-size: 0.7rem;
   color: #9ca3af;
