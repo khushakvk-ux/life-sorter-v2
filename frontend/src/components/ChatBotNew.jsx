@@ -4720,12 +4720,15 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                   onClick={() => tool.url && window.open(tool.url, '_blank')}
                                   style={{ animationDelay: `${i * 0.06}s`, cursor: tool.url ? 'pointer' : 'default' }}
                                 >
-                                  <div className={`report-tool-badge ${tool._type}`}>
-                                    {tool._type === 'gpt' ? 'GPT' : tool._type === 'provider' ? 'SaaS' : 'Tool'}
-                                  </div>
-                                  <div className="report-tool-name">
-                                    {tool.name}
-                                    {tool.free && <span className="report-tool-free">Free</span>}
+                                  <div className="report-tool-top-row">
+                                    <div className={`report-tool-badge ${tool._type}`}>
+                                      {tool._type === 'gpt' ? 'GPT' : tool._type === 'provider' ? 'SaaS' : 'Tool'}
+                                    </div>
+                                    <div className="report-tool-name">
+                                      {tool.name}
+                                      {tool.free && <span className="report-tool-free">Free</span>}
+                                    </div>
+                                    {tool.url && <span className="report-tool-arrow">→</span>}
                                   </div>
                                   {tool.why_recommended && (
                                     <div className="report-tool-why">{tool.why_recommended}</div>
@@ -4737,7 +4740,6 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                       {tool.ease_of_use && <div className="report-tool-context-row"><span className="ctx-label ease">⚡ Ease:</span> {tool.ease_of_use}</div>}
                                     </div>
                                   )}
-                                  {tool.url && <span className="report-tool-arrow">→</span>}
                                 </div>
                               ))}
                             </div>
@@ -4754,12 +4756,15 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                       onClick={() => tool.url && window.open(tool.url, '_blank')}
                                       style={{ animationDelay: `${(i + 3) * 0.06}s`, cursor: tool.url ? 'pointer' : 'default' }}
                                     >
-                                      <div className={`report-tool-badge ${tool._type}`}>
-                                        {tool._type === 'gpt' ? 'GPT' : tool._type === 'provider' ? 'SaaS' : 'Tool'}
-                                      </div>
-                                      <div className="report-tool-name">
-                                        {tool.name}
-                                        {tool.free && <span className="report-tool-free">Free</span>}
+                                      <div className="report-tool-top-row">
+                                        <div className={`report-tool-badge ${tool._type}`}>
+                                          {tool._type === 'gpt' ? 'GPT' : tool._type === 'provider' ? 'SaaS' : 'Tool'}
+                                        </div>
+                                        <div className="report-tool-name">
+                                          {tool.name}
+                                          {tool.free && <span className="report-tool-free">Free</span>}
+                                        </div>
+                                        {tool.url && <span className="report-tool-arrow">→</span>}
                                       </div>
                                       {tool.why_recommended && (
                                         <div className="report-tool-why">{tool.why_recommended}</div>
@@ -4771,7 +4776,6 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                                           {tool.ease_of_use && <div className="report-tool-context-row"><span className="ctx-label ease">⚡ Ease:</span> {tool.ease_of_use}</div>}
                                         </div>
                                       )}
-                                      {tool.url && <span className="report-tool-arrow">→</span>}
                                     </div>
                                   ))}
                                 </div>
