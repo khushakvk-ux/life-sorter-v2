@@ -799,14 +799,15 @@ async def run_agent3_playbook_architect(
         )
     user_message += (
         "Build the 10-step playbook now. Follow the exact output format. "
-        "Every step must be specific to THIS company — nothing generic."
+        "Every step must be specific to THIS company — nothing generic. "
+        "You MUST include all 10 steps — do NOT stop early. Exactly 10 numbered steps."
     )
 
     result = await _call_claude(
         system_prompt=AGENT3_PROMPT,
         user_message=user_message,
         temperature=0.7,
-        max_tokens=6000,
+        max_tokens=10000,
     )
 
     logger.info(

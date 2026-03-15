@@ -524,6 +524,9 @@ const ChatBotNewMobile = ({ onNavigate }) => {
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [taskClickProcessing, setTaskClickProcessing] = useState(false);
+  const [outcomeClickProcessing, setOutcomeClickProcessing] = useState(false);
+  const [domainClickProcessing, setDomainClickProcessing] = useState(false);
+  const [answerProcessing, setAnswerProcessing] = useState(false);
   const [thinkingPhraseIndex, setThinkingPhraseIndex] = useState(0);
   const [loadingPhase, setLoadingPhase] = useState('');
   const [selectedGoal, setSelectedGoal] = useState(null);
@@ -1086,6 +1089,10 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     setCopiedPrompt(false);
 
     // Reset AI Agent session state
+    setTaskClickProcessing(false);
+    setOutcomeClickProcessing(false);
+    setDomainClickProcessing(false);
+    setAnswerProcessing(false);
     setSessionId(null);
     sessionIdRef.current = null;
     setDynamicQuestions([]);
@@ -1108,6 +1115,8 @@ const ChatBotNewMobile = ({ onNavigate }) => {
 
   // Handle outcome selection (Question 1)
   const handleOutcomeClick = async (outcome) => {
+    if (outcomeClickProcessing) return;
+    setOutcomeClickProcessing(true);
     setSelectedGoal(outcome.id);
 
     const userMessage = {
@@ -1146,10 +1155,13 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     }
 
     saveToSheet(`Selected Outcome: ${outcome.text}`, '', '', '');
+    setOutcomeClickProcessing(false);
   };
 
   // Handle domain selection (Question 2)
   const handleDomainClickNew = async (domain) => {
+    if (domainClickProcessing) return;
+    setDomainClickProcessing(true);
     setSelectedDomainName(domain);
 
     const userMessage = {
@@ -1187,6 +1199,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
     }
 
     saveToSheet(`Selected Domain: ${domain}`, '', '', '');
+    setDomainClickProcessing(false);
   };
 
   // Handle task selection (Question 3) - Claude RCA or fallback
@@ -1353,6 +1366,8 @@ const ChatBotNewMobile = ({ onNavigate }) => {
 
   // Handle dynamic question answer (option click) — supports RCA & fallback
   const handleDynamicAnswer = async (answer) => {
+    if (answerProcessing) return;
+    setAnswerProcessing(true);
     const currentQ = dynamicQuestions[currentDynamicQIndex];
     const newAnswers = { ...dynamicAnswers, [currentDynamicQIndex]: answer };
     setDynamicAnswers(newAnswers);
@@ -1465,6 +1480,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
                 };
 
                 setMessages(prev => [...prev, transMsg, pqMsg]);
+                setAnswerProcessing(false);
                 return;
               }
             } catch (e) {
@@ -1472,6 +1488,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
             }
 
             setIsTyping(false);
+            setAnswerProcessing(false);
             await proceedToReport(rcaSummaryText, crawlPoints);
             return;
           }
@@ -1501,6 +1518,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
             };
             setMessages(prev => [...prev, botMsg]);
             setIsTyping(false);
+            setAnswerProcessing(false);
             return;
           }
         }
@@ -1509,6 +1527,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
       }
 
       setIsTyping(false);
+      setAnswerProcessing(false);
       crawlSummaryRef.current = null;
       if (userEmail) {
         await startPlaybook();
@@ -1563,6 +1582,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
       };
       setMessages(prev => [...prev, userMsg, botMsg]);
       setCurrentDynamicQIndex(currentDynamicQIndex + 1);
+      setAnswerProcessing(false);
     } else {
       // All dynamic questions answered — gate behind auth
       setMessages(prev => [...prev, userMsg]);
@@ -1583,6 +1603,7 @@ const ChatBotNewMobile = ({ onNavigate }) => {
         };
         setMessages(prev => [...prev, authMsg]);
         setFlowStage('auth-gate');
+        setAnswerProcessing(false);
       }
     }
   };
@@ -3445,7 +3466,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                     <div
                       key={outcome.id}
                       className="suggestion-card"
-                      onClick={() => handleOutcomeClick(outcome)}
+                      onClick={() => !outcomeClickProcessing && handleOutcomeClick(outcome)}
                       style={{ animationDelay: `${index * 0.1}s`, animation: 'fadeIn 0.5s ease-out forwards' }}
                     >
                       <h3>{outcome.text}</h3>
@@ -3467,7 +3488,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                     <div
                       key={index}
                       className="suggestion-card"
-                      onClick={() => handleDomainClickNew(domain)}
+                      onClick={() => !domainClickProcessing && handleDomainClickNew(domain)}
                       style={{ animationDelay: `${index * 0.1}s`, animation: 'fadeIn 0.5s ease-out forwards' }}
                     >
                       <h3>{domain}</h3>
@@ -4219,8 +4240,8 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                             <button
                               key={i}
                               className="diagnostic-option-btn"
-                              onClick={() => !isTyping && handleDynamicAnswer(opt)}
-                              disabled={isTyping}
+                              onClick={() => !isTyping && !answerProcessing && handleDynamicAnswer(opt)}
+                              disabled={isTyping || answerProcessing}
                               style={{
                                 animationDelay: `${i * 0.04}s`,
                                 opacity: isTyping ? 0.5 : undefined,

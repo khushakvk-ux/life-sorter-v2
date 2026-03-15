@@ -214,56 +214,49 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
         # Store the full diagnostic context for Claude to use
         session_store.set_rca_context(session.session_id, diagnostic)
 
-    # ── Generate EARLY recommendations + first Claude question IN PARALLEL ─
+    # ── INSTANT early recommendations (pre-mapped JSON, <1ms) ────
+    from app.services.instant_tool_service import get_tools_for_q1_q2_q3
+
     early_recs = []
     early_message = ""
-
-    async def _get_early_recs():
-        nonlocal early_recs, early_message
-        try:
-            early_result = await agent_service.generate_early_recommendations(
-                outcome=session.outcome or "",
-                outcome_label=session.outcome_label or "",
-                domain=session.domain or "",
-                task=session.task or "",
+    try:
+        instant_result = get_tools_for_q1_q2_q3(
+            outcome=session.outcome or "",
+            domain=session.domain or "",
+            task=session.task or "",
+        )
+        if instant_result and instant_result.get("tools"):
+            early_recs = [
+                EarlyToolRecommendation(
+                    name=t.get("name", ""),
+                    description=t.get("description", ""),
+                    url=t.get("url"),
+                    category=t.get("category", ""),
+                    rating=str(t.get("rating", "")) if t.get("rating") is not None else None,
+                    why_relevant=t.get("best_use_case", ""),
+                )
+                for t in instant_result["tools"]
+            ]
+            early_message = instant_result.get("message", "")
+            session_store.set_early_recommendations(
+                session.session_id,
+                tools=instant_result["tools"],
+                message=early_message,
             )
-            if early_result and early_result.get("tools"):
-                early_recs = [
-                    EarlyToolRecommendation(
-                        name=t.get("name", ""),
-                        description=t.get("description", ""),
-                        url=t.get("url"),
-                        category=t.get("category", ""),
-                        rating=t.get("rating"),
-                        why_relevant=t.get("why_relevant", ""),
-                        implementation_stage=t.get("implementation_stage", ""),
-                        issue_solved=t.get("issue_solved", ""),
-                        ease_of_use=t.get("ease_of_use", ""),
-                    )
-                    for t in early_result["tools"]
-                ]
-                early_message = early_result.get("message", "")
-                session_store.set_early_recommendations(
-                    session.session_id,
-                    tools=early_result["tools"],
-                    message=early_message,
-                )
-                # Log to context pool
-                meta = early_result.get("_meta")
-                if meta:
-                    session_store.add_llm_call_log(session.session_id, **meta)
-                logger.info(
-                    "Early recommendations generated after Q3",
-                    session_id=session.session_id,
-                    tools_count=len(early_recs),
-                )
-        except Exception as e:
-            logger.warning(
-                "Early recommendations failed (non-blocking)",
+            logger.info(
+                "Instant early recommendations after Q3",
                 session_id=session.session_id,
-                error=str(e),
+                tools_count=len(early_recs),
+                match_type=instant_result.get("match_type"),
             )
+    except Exception as e:
+        logger.warning(
+            "Instant recommendations failed (non-blocking)",
+            session_id=session.session_id,
+            error=str(e),
+        )
 
+    # ── First Claude RCA question ──────────────────────────────
     claude_result_holder = [None]
 
     async def _get_first_rca():
@@ -278,8 +271,8 @@ async def set_task_and_generate_questions(request: Request, body: SetTaskRequest
             gbp_data=session.gbp_data or None,
         )
 
-    # Run both in parallel — cuts Q3 delay by ~40-50%
-    await asyncio.gather(_get_early_recs(), _get_first_rca())
+    await _get_first_rca()
+
 
     claude_result = claude_result_holder[0]
 
@@ -861,6 +854,36 @@ async def get_recommendations(request: Request, body: GetRecommendationsRequest 
         summary=recs.get("summary", ""),
         session_context=summary,
     )
+
+
+
+
+# ── Instant Q1×Q2×Q3 Tool Lookup ──────────────────────────────
+
+class InstantToolsRequest(BaseModel):
+    outcome: str
+    domain: str
+    task: str
+    limit: int = 10
+
+
+@router.post("/session/instant-tools")
+@limiter.limit(lambda: get_settings().RATE_LIMIT_CHAT)
+async def get_instant_tools_endpoint(request: Request, body: InstantToolsRequest = Body(...)):
+    """
+    Zero-latency tool lookup by Q1 (outcome) × Q2 (domain) × Q3 (task).
+    Returns pre-mapped tool recommendations from the static JSON mapping.
+    No LLM, no RAG — pure dictionary lookup in <1ms.
+    """
+    from app.services.instant_tool_service import get_tools_for_q1_q2_q3
+
+    result = get_tools_for_q1_q2_q3(
+        outcome=body.outcome,
+        domain=body.domain,
+        task=body.task,
+        limit=body.limit,
+    )
+    return result
 
 
 @router.get("/session/{session_id}", response_model=SessionContextResponse)

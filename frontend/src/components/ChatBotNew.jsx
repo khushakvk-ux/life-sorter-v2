@@ -1160,6 +1160,9 @@ const ChatBotNew = ({ onNavigate }) => {
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [taskClickProcessing, setTaskClickProcessing] = useState(false);
+  const [outcomeClickProcessing, setOutcomeClickProcessing] = useState(false);
+  const [domainClickProcessing, setDomainClickProcessing] = useState(false);
+  const [answerProcessing, setAnswerProcessing] = useState(false);
   const [loadingPhase, setLoadingPhase] = useState(''); // '', 'tools', 'diagnostic'
   const [selectedGoal, setSelectedGoal] = useState(null);
   const [selectedDomain, setSelectedDomain] = useState(null);
@@ -1723,6 +1726,12 @@ const ChatBotNew = ({ onNavigate }) => {
     setPersonaLoaded(null);
     setDynamicFreeText('');
 
+    // Reset processing guards
+    setTaskClickProcessing(false);
+    setOutcomeClickProcessing(false);
+    setDomainClickProcessing(false);
+    setAnswerProcessing(false);
+
     // Reset Claude RCA mode
     setRcaMode(false);
 
@@ -1747,6 +1756,8 @@ const ChatBotNew = ({ onNavigate }) => {
 
   // Handle outcome selection (Question 1)
   const handleOutcomeClick = async (outcome) => {
+    if (outcomeClickProcessing) return;
+    setOutcomeClickProcessing(true);
     setSelectedGoal(outcome.id);
 
     const userMessage = {
@@ -1785,10 +1796,13 @@ const ChatBotNew = ({ onNavigate }) => {
     }
 
     saveToSheet(`Selected Outcome: ${outcome.text}`, '', '', '');
+    setOutcomeClickProcessing(false);
   };
 
   // Handle domain selection (Question 2)
   const handleDomainClick = async (domain) => {
+    if (domainClickProcessing) return;
+    setDomainClickProcessing(true);
     setSelectedDomainName(domain);
 
     const userMessage = {
@@ -1826,6 +1840,7 @@ const ChatBotNew = ({ onNavigate }) => {
     }
 
     saveToSheet(`Selected Domain: ${domain}`, '', '', '');
+    setDomainClickProcessing(false);
   };
 
   // Handle task selection (Question 3) - Loads diagnostic via Claude RCA or fallback
@@ -1998,6 +2013,8 @@ const ChatBotNew = ({ onNavigate }) => {
 
   // Handle diagnostic option click — in-chat flow (supports both RCA & fallback)
   const handleDynamicAnswer = async (answer) => {
+    if (answerProcessing) return;
+    setAnswerProcessing(true);
     const currentQ = dynamicQuestions[currentDynamicQIndex];
     const newAnswers = { ...dynamicAnswers, [currentDynamicQIndex]: answer };
     setDynamicAnswers(newAnswers);
@@ -2117,6 +2134,7 @@ const ChatBotNew = ({ onNavigate }) => {
                 };
 
                 setMessages(prev => [...prev, transMsg, pqMsg]);
+                setAnswerProcessing(false);
                 return;
               }
             } catch (e) {
@@ -2125,6 +2143,7 @@ const ChatBotNew = ({ onNavigate }) => {
 
             // No precision questions — go directly to report/auth
             setIsTyping(false);
+            setAnswerProcessing(false);
             await proceedToReport(rcaSummaryText, crawlPoints);
             return;
           }
@@ -2155,6 +2174,7 @@ const ChatBotNew = ({ onNavigate }) => {
             };
             setMessages(prev => [...prev, botMsg]);
             setIsTyping(false);
+            setAnswerProcessing(false);
             return;
           }
         }
@@ -2180,6 +2200,7 @@ const ChatBotNew = ({ onNavigate }) => {
         setMessages(prev => [...prev, authMsg]);
         setFlowStage('auth-gate');
       }
+      setAnswerProcessing(false);
       return;
     }
 
@@ -4376,8 +4397,8 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                       <div
                         key={outcome.id}
                         className="suggestion-card"
-                        onClick={() => handleOutcomeClick(outcome)}
-                        style={{ animationDelay: `${index * 0.1}s`, animation: 'fadeIn 0.5s ease-out forwards' }}
+                        onClick={() => !outcomeClickProcessing && handleOutcomeClick(outcome)}
+                        style={{ animationDelay: `${index * 0.1}s`, animation: 'fadeIn 0.5s ease-out forwards', opacity: outcomeClickProcessing ? 0.5 : 1, pointerEvents: outcomeClickProcessing ? 'none' : 'auto' }}
                       >
                         <h3>{outcome.text}</h3>
                         {outcome.subtext && <p className="goal-subtext">{outcome.subtext}</p>}
@@ -4398,8 +4419,8 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                       <div
                         key={index}
                         className="suggestion-card"
-                        onClick={() => handleDomainClick(domain)}
-                        style={{ animationDelay: `${index * 0.1}s`, animation: 'fadeIn 0.5s ease-out forwards' }}
+                        onClick={() => !domainClickProcessing && handleDomainClick(domain)}
+                        style={{ animationDelay: `${index * 0.1}s`, animation: 'fadeIn 0.5s ease-out forwards', opacity: domainClickProcessing ? 0.5 : 1, pointerEvents: domainClickProcessing ? 'none' : 'auto' }}
                       >
                         <h3>{domain}</h3>
                       </div>
@@ -4487,8 +4508,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                             <h3>{option}</h3>
                           </div>
                           );
-                        }}
-                        ))}
+                        })}
                       </div>
                       <button
                         onClick={() => {
@@ -5314,8 +5334,8 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                               <button
                                 key={i}
                                 className="diagnostic-option-btn"
-                                onClick={() => !isTyping && handleDynamicAnswer(opt)}
-                                disabled={isTyping}
+                                onClick={() => !isTyping && !answerProcessing && handleDynamicAnswer(opt)}
+                                disabled={isTyping || answerProcessing}
                                 style={{
                                   animationDelay: `${i * 0.04}s`,
                                   opacity: isTyping ? 0.5 : undefined,
@@ -5575,9 +5595,7 @@ This solution helps at the **${subDomainName}** stage of your ${domainName} oper
                       </div>
                       );
                     })()
-                        ))}
-                      </div>
-                    )}
+                    }
 
                     {/* RCA Data Collection Actions */}
                     {message.showRCADataCollectionActions && (
